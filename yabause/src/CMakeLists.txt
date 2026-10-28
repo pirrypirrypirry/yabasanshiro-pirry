@@ -357,13 +357,6 @@ if (YAB_WANT_OPENGL AND (YAB_RGB STREQUAL ""))
 		)
 		add_definitions(-DYAB_PORT_OSD)
 
-# Development instrumentation (instrument.h): performance counters, wall-clock timers and one
-# "INSTR:" line per second on stderr. Off for release builds.
-option(YABA_INSTRUMENT "Compile in development counters and timers" OFF)
-if(YABA_INSTRUMENT)
-  add_definitions(-DYABA_INSTRUMENT)
-endif()
-
 		
 		include(FindGLUT)
 		if (GLUT_FOUND)

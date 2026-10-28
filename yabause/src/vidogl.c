@@ -62,19 +62,11 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 /* The render thread reads the line registers through this pointer (live or from the snapshot), see vdp2.cpp. */
 extern Vdp2 * Vdp2LinesRender;
 
-/* Per-layer bit mask of the CPU drawing path used in the current second.
-   Index 0-3 = NBG0-3, index 4 = RBG0. Bits:
-     1 = bitmap with zoom / line zoom
-     2 = cells with line scroll
-     4 = cells (normal)
-     8 = NBG2/3 with line scroll
-   0 means the layer did not use any of these CPU paths. Reset in vdp2.cpp after the per-second output. */
-unsigned char g_nbgweg[5] = { 0, 0, 0, 0, 0 };
 
 
 /* char_bank[] has four elements and is indexed by charaddr >> 17.
    Out-of-range addresses are treated as invalid instead of reading past the end of the array. */
-static INLINE int BankUngueltig(const u16 *bank, u32 addr)
+static INLINE int BankInvalid(const u16 *bank, u32 addr)
 {
   u32 idx = addr >> 17;
   if (idx >= 4) {
@@ -88,35 +80,25 @@ static INLINE int BankUngueltig(const u16 *bank, u32 addr)
    V[i] - V[0] == i for every line, the per-pixel path computes the same result as the tiled GPU path
    (targetv = sv + v + V[0]), so such a layer can use the cheaper path.
    Required: H[i] == H[0], Inc[i] == 0x100, V[i] - V[0] == i, coordincy == 1.0 and no vertical cell scroll. */
-static inline int PerLineIdentAn(void) {
-  static int v = -1;
-  if (v < 0) {
-    v = 1;   /* fixed on */
-  }
-  return v;
-}
 
 /* Returns 1 if the line table is an identity ramp and stores the constant offset in *h0/*v0. */
 /* `hoehe` is passed in instead of reading vdp2height, which is declared after this function. */
 #include <time.h>   /* time() */
-static int PerLineIstIdentitaet(vdp2draw_struct *info, int hoehe, int *h0, int *v0) {
+static int PerLineIsIdentity(vdp2draw_struct *info, int height_val, int *h0, int *v0) {
   int i;
   const int H0 = info->lineinfo[0].LineScrollValH;
   const int V0 = info->lineinfo[0].LineScrollValV;
   if (!info->islinescroll) return 0;
   if (info->isverticalscroll) return 0;
   if (info->coordincy != 1.0f) return 0;
-  if (hoehe <= 0) return 0;
-  for (i = 0; i < hoehe; i++) {
+  if (height_val <= 0) return 0;
+  for (i = 0; i < height_val; i++) {
     if (info->lineinfo[i].LineScrollValH != H0 || info->lineinfo[i].CoordinateIncH != 0x100
         || info->lineinfo[i].LineScrollValV - V0 != i) return 0;
   }
   *h0 = H0; *v0 = V0;
   return 1;
 }
-#include "instrument.h"
-#define NBGWEG(pinfo, bit) \
-  INSTR(((unsigned)(pinfo)->id < 5u) ? (g_nbgweg[(pinfo)->id] |= (unsigned char)(bit)) : 0)
 
 #define Y_MAX(a, b) ((a) > (b) ? (a) : (b))
 #define Y_MIN_FF(a, b) ((a) < (b) ? (a) : (b))
@@ -187,11 +169,6 @@ void VIDOGLVdp1DrawEnd(void);
 /* Draw call batching: consecutive VDP1 commands can share one draw call (sprite.id = 0).
    Blend modes that read the VDP1 framebuffer as a texture (halftransparency, shadow, mesh) see the state
    at the start of the batch, so batched overlapping polygons all read the same stale background. */
-static int BatchIdOn(void) {
-  static int v = -1;
-  if (v < 0) { v = 1; }   /* fixed on */
-  return v;
-}
 static unsigned s_batch_seq = 0;
 
 /* Batch only where it is harmless.
@@ -203,7 +180,7 @@ static unsigned s_batch_seq = 0;
    change a channel inside the color code mask. Textures that can contain RGB: all corner values must be
    exactly 16/16/16 (neutral). The hardware effect of Gouraud on color calculation/priority bits above the
    color code is not reproduced. */
-static int GouraudOhneWirkung(u16 pmod) {
+static int GouraudNoEffect(u16 pmod) {
   if (fixVdp2Regs == NULL || Vdp1RamRender == NULL) return 0;
   if ((pmod & 7) != 4) return 0;
   {
@@ -226,7 +203,7 @@ static int GouraudOhneWirkung(u16 pmod) {
   return 1;
 }
 
-static int BlendLiestFramebuffer(int blendmode) {
+static int BlendReadsFramebuffer(int blendmode) {
   /* A program reads the framebuffer exactly when its fragment shader declares `u_fbo`
      (param->fbo != -1, see yglshaderes.c). Reachable blend modes: SHADOW, GROW_HALF_TRANSPARENT and MESH.
      HALF_LUMINANCE only reads s_texture and GROW_LUMINANCE is never assigned.
@@ -246,26 +223,11 @@ static int BlendLiestFramebuffer(int blendmode) {
 /* Atlas flush threshold based on observed growth instead of a fixed half.
    The atlas is flushed only when the remaining space is smaller than 1.5 times the largest growth of
    a frame (decaying peak) plus a minimum reserve (256 rows). The first frame after a reset is not counted. */
-static int g_atl_ymax_vor = -1, g_atl_frisch = 1, g_atl_wachs = 0;
-static int AtlasAdaptAn(void) {
-  static int v = -1;
-  if (v < 0) { v = 1; }   /* fixed on */
-  return v;
-}
-static int AtlasAdaptMin(void) {
-  static int v = -1;
-  if (v < 0) { v = 256; }   /* fixed */
-  return v;
-}
-static int AtlasHalbAn(void) {
-  static int v = -1;
-  if (v < 0) { v = 1; }   /* fixed on */
-  return v;
-}
+static int g_atl_ymax_prev = -1, g_atl_fresh = 1, g_atl_grow = 0;
 
 static int BatchId(int blendmode) {
-  const int liest = BlendLiestFramebuffer(blendmode);
-  return (BatchIdOn() && !liest) ? 0 : (int)(++s_batch_seq);
+  const int reads = BlendReadsFramebuffer(blendmode);
+  return !reads ? 0 : (int)(++s_batch_seq);
 }
 
 void VIDOGLVdp1NormalSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer);
@@ -333,7 +295,7 @@ VIDOGLVulkanGetScreenshot
 float vdp1wratio = 1;
 float vdp1hratio = 1;
 static u8 oglAcVram[4][8] = { { 0 } }; /* port: frame-stable VRAM access mask */
-static unsigned int g_einweg_bild = 1, g_einweg_zuletzt[16];
+static unsigned int g_oneway_frame = 1, g_oneway_last[16];
 static int vdp1_interlace = 0;
 
 int GlWidth = 320;
@@ -423,56 +385,48 @@ static INLINE void Vdp1MaskSpritePixel(int type, u16 * pixel, int *colorcalc)
   {
   case 0x0:
   {
-    /* xel |= (*colorcalc & 0x07) << 11; */
     *colorcalc = (*pixel >> 11) & 0x7;
     *pixel &= 0x7FF;
     break;
   }
   case 0x1:
   {
-    /* xel |= (*colorcalc & 0x03) << 11; */
     *colorcalc = (*pixel >> 11) & 0x3;
     *pixel &= 0x7FF;
     break;
   }
   case 0x2:
   {
-    /* xel |= (*colorcalc & 0x07) << 11; */
     *colorcalc = (*pixel >> 11) & 0x7;
     *pixel &= 0x7FF;
     break;
   }
   case 0x3:
   {
-    /* xel |= (*colorcalc & 0x03) << 11; */
     *colorcalc = (*pixel >> 11) & 0x3;
     *pixel &= 0x7FF;
     break;
   }
   case 0x4:
   {
-    /* xel |= (*colorcalc & 0x07) << 10; */
     *colorcalc = (*pixel >> 10) & 0x7;
     *pixel &= 0x3FF;
     break;
   }
   case 0x5:
   {
-    /* xel |= (*colorcalc & 0x01) << 11; */
     *colorcalc = (*pixel >> 11) & 0x1;
     *pixel &= 0x7FF;
     break;
   }
   case 0x6:
   {
-    /* xel |= (*colorcalc & 0x03) << 10; */
     *colorcalc = (*pixel >> 10) & 0x3;
     *pixel &= 0x3FF;
     break;
   }
   case 0x7:
   {
-    /* xel |= (*colorcalc & 0x09) << 7; */
     *colorcalc = (*pixel >> 9) & 0x7;
     *pixel &= 0x1FF;
     break;
@@ -485,7 +439,6 @@ static INLINE void Vdp1MaskSpritePixel(int type, u16 * pixel, int *colorcalc)
   }
   case 0x9:
   {
-    /* xel |= (*colorcalc & 0x01) << 6; */
     *colorcalc = (*pixel >> 6) & 0x1;
     *pixel &= 0x3F;
     break;
@@ -498,7 +451,6 @@ static INLINE void Vdp1MaskSpritePixel(int type, u16 * pixel, int *colorcalc)
   }
   case 0xB:
   {
-    /* xel |= (*colorcalc & 0x03) << 6; */
     *colorcalc = (*pixel >> 6) & 0x3;
     *pixel &= 0x3F;
     break;
@@ -511,7 +463,6 @@ static INLINE void Vdp1MaskSpritePixel(int type, u16 * pixel, int *colorcalc)
   }
   case 0xD:
   {
-    /* xel |= (*colorcalc & 0x01) << 6; */
     *colorcalc = (*pixel >> 6) & 0x1;
     *pixel &= 0xFF;
     break;
@@ -524,7 +475,6 @@ static INLINE void Vdp1MaskSpritePixel(int type, u16 * pixel, int *colorcalc)
   }
   case 0xF:
   {
-    /* xel |= (*colorcalc & 0x03) << 6; */
     *colorcalc = (*pixel >> 6) & 0x3;
     *pixel &= 0xFF;
     break;
@@ -558,7 +508,10 @@ static u32 FASTCALL Vdp1ReadPolygonColor(vdp1cmd_struct *cmd)
 
   Vdp1ReadPriority(cmd, &priority, &colorcl, &nromal_shadow);
 
-  switch ((cmd->CMDPMOD >> 3) & 0x7)
+  /* invalid color mode 6 behaves like mode 5 (Kronos, Hi-Octane) */
+  int poly_mode = (cmd->CMDPMOD >> 3) & 0x7;
+  if (poly_mode == 6) poly_mode = 5;
+  switch (poly_mode)
   {
   case 0:
   {
@@ -1276,8 +1229,8 @@ static void Vdp1SetTextureRatio(int vdp2widthratio, int vdp2heightratio)
   // may need some tweaking
 
   /* Read from the snapshot, otherwise the geometry jumps mid-frame when the SH2 changes TVMR/FBCR while drawing. */
-  const u16 v1r_tvmr = Vdp1RenderRegsGueltig ? Vdp1RenderTVMR : Vdp1Regs->TVMR;
-  const u16 v1r_fbcr = Vdp1RenderRegsGueltig ? Vdp1RenderFBCR : Vdp1Regs->FBCR;
+  const u16 v1r_tvmr = Vdp1RenderRegsValid ? Vdp1RenderTVMR : Vdp1Regs->TVMR;
+  const u16 v1r_fbcr = Vdp1RenderRegsValid ? Vdp1RenderFBCR : Vdp1Regs->FBCR;
   // Figure out which vdp1 screen mode to use
   switch (v1r_tvmr & 7)
   {
@@ -2227,7 +2180,7 @@ static void FASTCALL Vdp2DrawBitmap(vdp2draw_struct *info, YglTexture *texture)
   case 0: // 4 BPP
     for (i = 0; i < info->cellh; i++)
     {
-      if (BankUngueltig(info->char_bank, info->charaddr)) {
+      if (BankInvalid(info->char_bank, info->charaddr)) {
         for (j = 0; j < info->cellw; j += 4)
         {
           *texture->textdata = 0;
@@ -2254,7 +2207,7 @@ static void FASTCALL Vdp2DrawBitmap(vdp2draw_struct *info, YglTexture *texture)
   case 1: // 8 BPP
     for (i = 0; i < info->cellh; i++)
     {
-      if (BankUngueltig(info->char_bank, info->charaddr)) {
+      if (BankInvalid(info->char_bank, info->charaddr)) {
         for (j = 0; j < info->cellw; j += 2)
         {
           *texture->textdata = 0x00000000;
@@ -2277,7 +2230,7 @@ static void FASTCALL Vdp2DrawBitmap(vdp2draw_struct *info, YglTexture *texture)
   case 2: // 16 BPP(palette)
     for (i = 0; i < info->cellh; i++)
     {
-      if (BankUngueltig(info->char_bank, info->charaddr)) {
+      if (BankInvalid(info->char_bank, info->charaddr)) {
         for (j = 0; j < info->cellw; j++ )
         {
           *texture->textdata = 0;
@@ -2298,7 +2251,7 @@ static void FASTCALL Vdp2DrawBitmap(vdp2draw_struct *info, YglTexture *texture)
   case 3: // 16 BPP(RGB)
     for (i = 0; i < info->cellh; i++)
     {
-      if (BankUngueltig(info->char_bank, info->charaddr)) {
+      if (BankInvalid(info->char_bank, info->charaddr)) {
         for (j = 0; j < info->cellw; j++ )
         {
           *texture->textdata = 0;
@@ -2320,7 +2273,7 @@ static void FASTCALL Vdp2DrawBitmap(vdp2draw_struct *info, YglTexture *texture)
     for (i = 0; i < info->cellh; i++)
     {
 /*
-      if (BankUngueltig(info->char_bank, info->charaddr)) {
+      if (BankInvalid(info->char_bank, info->charaddr)) {
         for (j = 0; j < info->cellw; j++)
         {
           *texture->textdata = 0;
@@ -2349,13 +2302,6 @@ static void FASTCALL Vdp2DrawBitmap(vdp2draw_struct *info, YglTexture *texture)
 
 
 
-/* Debug mask for omitting individual background layers (bit 0 = NBG0 ... bit 4 = RBG0); disabled in this build. */
-static int g_nbgaus = -1;
-static INLINE int NbgAus(int n) {
-  (void)n; return 0;
-  if (g_nbgaus < 0) { g_nbgaus = 0; }
-  return (g_nbgaus >> n) & 1;
-}
 
 static void FASTCALL Vdp2DrawCell(vdp2draw_struct *info, YglTexture *texture)
 {
@@ -2363,7 +2309,7 @@ static void FASTCALL Vdp2DrawCell(vdp2draw_struct *info, YglTexture *texture)
 
 
   // Access Denied(Wizardry - Llylgamyn Saga)
-  if (BankUngueltig(info->char_bank, info->charaddr)) {
+  if (BankInvalid(info->char_bank, info->charaddr)) {
     for (i = 0; i < info->cellh; i++)
     {
       for (j = 0; j < info->cellw; j++)
@@ -2446,7 +2392,8 @@ static void FASTCALL Vdp2DrawBitmapLineScroll(vdp2draw_struct *info, YglTexture 
     u32 baseaddr;
     vdp2Lineinfo * line;
     baseaddr = (u32)info->charaddr;
-    line = &(info->lineinfo[i*info->lineinc]);
+    /* one line-scroll entry per interval (Vdp2GenLineinfo steps i by lineinc) */
+    line = &(info->lineinfo[(info->lineinc > 1) ? i / (int)info->lineinc : i]);
 
     if (VDPLINE_SX(info->islinescroll))
       sh = line->LineScrollValH + info->sh;
@@ -2468,7 +2415,7 @@ static void FASTCALL Vdp2DrawBitmapLineScroll(vdp2draw_struct *info, YglTexture 
     case 0:
       baseaddr += ((sh + sv * (info->cellw >> 2)) << 1);
 
-      if (BankUngueltig(info->char_bank, baseaddr)) {
+      if (BankInvalid(info->char_bank, baseaddr)) {
         for (j = 0; j < vdp2width; j += 4)
         {
           *texture->textdata++ = 0;
@@ -2488,7 +2435,7 @@ static void FASTCALL Vdp2DrawBitmapLineScroll(vdp2draw_struct *info, YglTexture 
       break;
     case 1:
       baseaddr += sh + sv * info->cellw;
-      if (BankUngueltig(info->char_bank, baseaddr)) {
+      if (BankInvalid(info->char_bank, baseaddr)) {
         for (j = 0; j < vdp2width; j += 2)
         {
           *texture->textdata++ = 0;
@@ -2506,7 +2453,7 @@ static void FASTCALL Vdp2DrawBitmapLineScroll(vdp2draw_struct *info, YglTexture 
       break;
     case 2:
       baseaddr += ((sh + sv * info->cellw) << 1);
-      if (BankUngueltig(info->char_bank, baseaddr)) {
+      if (BankInvalid(info->char_bank, baseaddr)) {
         for (j = 0; j < vdp2width; j++)
         {
           *texture->textdata++ = 0;
@@ -2524,7 +2471,7 @@ static void FASTCALL Vdp2DrawBitmapLineScroll(vdp2draw_struct *info, YglTexture 
       break;
     case 3:
       baseaddr += ((sh + sv * info->cellw) << 1);
-      if (BankUngueltig(info->char_bank, baseaddr)) {
+      if (BankInvalid(info->char_bank, baseaddr)) {
         for (j = 0; j < vdp2width; j++)
         {
           *texture->textdata++ = 0;
@@ -2541,7 +2488,7 @@ static void FASTCALL Vdp2DrawBitmapLineScroll(vdp2draw_struct *info, YglTexture 
       break;
     case 4:
       baseaddr += ((sh + sv * info->cellw) << 2);
-      if (BankUngueltig(info->char_bank, baseaddr)) {
+      if (BankInvalid(info->char_bank, baseaddr)) {
         for (j = 0; j < vdp2width; j++)
         {
           *texture->textdata++ = 0;
@@ -2552,7 +2499,6 @@ static void FASTCALL Vdp2DrawBitmapLineScroll(vdp2draw_struct *info, YglTexture 
         for (j = 0; j < vdp2width; j++)
         {
           //if (info->isverticalscroll){
-          //	sv += T1ReadLong(Vdp2RamRender, info->verticalscrolltbl+(j>>3) ) >> 16;
           //}
           *texture->textdata++ = Vdp2GetPixel32bppbmp(info, baseaddr);
           baseaddr += 4;
@@ -2567,7 +2513,6 @@ static void FASTCALL Vdp2DrawBitmapLineScroll(vdp2draw_struct *info, YglTexture 
 
 static void FASTCALL Vdp2DrawBitmapCoordinateInc(vdp2draw_struct *info, YglTexture *texture)
 {
-  NBGWEG(info, 1);                          /* bitmap with zoom */
   u32 color;
   int i, j;
 
@@ -2593,7 +2538,8 @@ static void FASTCALL Vdp2DrawBitmapCoordinateInc(vdp2draw_struct *info, YglTextu
     u32 baseaddr;
     vdp2Lineinfo * line;
     baseaddr = (u32)info->charaddr;
-    line = &(info->lineinfo[i*info->lineinc]);
+    /* one line-scroll entry per interval (Vdp2GenLineinfo steps i by lineinc) */
+    line = &(info->lineinfo[(info->lineinc > 1) ? i / (int)info->lineinc : i]);
 
     v = (i*incv) >> 8;
     if (VDPLINE_SZ(info->islinescroll))
@@ -2715,13 +2661,6 @@ static void FASTCALL Vdp2DrawBitmapCoordinateInc(vdp2draw_struct *info, YglTextu
 
 /* tile.specialprimode / specialcolormode were never set in Vdp2DrawPatternPos but are read for the program
    selection (specialprimode == 2) and program->specialcolormode. They now take the values of the layer. */
-static int g_kspez_an = -1;
-static INLINE int KachelSpezAn(void) {
-  if (g_kspez_an < 0) {
-    g_kspez_an = 1;   /* fixed on */
-  }
-  return g_kspez_an;
-}
 
 /* Tile template and program selection per layer instead of per tile.
    Vdp2DrawPatternPos is only called from Vdp2DrawMapTest. At the start of each Vdp2DrawMapTest call the template
@@ -2731,22 +2670,16 @@ static INLINE int KachelSpezAn(void) {
    (Vdp2PatternAddrPos/PlaneAddr only write paladdr/charaddr/flipfunction/specialfunction/specialcolorfunction/addr).
    Mode 2: the old block draws and the template tile is built alongside and compared (memcmp) per tile. */
 #include <time.h>
-static int g_ke_modus = 0;                 /* for the current Vdp2DrawMapTest call */
-static int g_ke_vorlage_ok = 0;
-static vdp2draw_struct g_ke_vorlage;       /* tile template of the current layer */
-static int KachelEbeneAn(void) {
-  static int s = -1;
-  if (s < 0) { s = 1; }   /* fixed on */
-  return s;
-}
-static void KachelEbeneBeginn(void) {
-  g_ke_modus = KachelEbeneAn();
-  if (!g_ke_modus) return;
-  g_ke_vorlage_ok = 0;
-  YglKachelEbeneBeginn();
+static int g_tl_mode = 0;                 /* for the current Vdp2DrawMapTest call */
+static int g_tl_template_ok = 0;
+static vdp2draw_struct g_tl_template;       /* tile template of the current layer */
+static void TileLayerBegin(void) {
+  g_tl_mode = 1;
+  g_tl_template_ok = 0;
+  YglTileLayerBegin();
 }
 /* Layer fields exactly as in the old block in Vdp2DrawPatternPos (without vertices/priority/flipfunction). */
-static void KeVorlageFuellen(vdp2draw_struct *t, const vdp2draw_struct *info) {
+static void TlTemplateFill(vdp2draw_struct *t, const vdp2draw_struct *info) {
   t->dst = 0;
   t->uclipmode = 0;
   t->colornumber = info->colornumber;
@@ -2763,21 +2696,16 @@ static void KeVorlageFuellen(vdp2draw_struct *t, const vdp2draw_struct *info) {
   t->LogicWin = info->LogicWin;
   t->lineTexture = info->lineTexture;
   t->id = info->id;
-  if (KachelSpezAn()) {
-    t->specialprimode = info->specialprimode;
-    t->specialcolormode = info->specialcolormode;
-  } else {
-    t->specialprimode = 0;
-    t->specialcolormode = 0;
-  }
+  t->specialprimode = info->specialprimode;
+  t->specialcolormode = info->specialcolormode;
   t->cellw = t->cellh = info->patternpixelwh;
   t->cor = info->cor;
   t->cog = info->cog;
   t->cob = info->cob;
 }
-static INLINE vdp2draw_struct *KeKachel(const vdp2draw_struct *info, int x, int y, int lines) {
-  vdp2draw_struct *t = &g_ke_vorlage;
-  if (!g_ke_vorlage_ok) { KeVorlageFuellen(t, info); g_ke_vorlage_ok = 1; }
+static INLINE vdp2draw_struct *TlTile(const vdp2draw_struct *info, int x, int y, int lines) {
+  vdp2draw_struct *t = &g_tl_template;
+  if (!g_tl_template_ok) { TlTemplateFill(t, info); g_tl_template_ok = 1; }
   t->flipfunction = info->flipfunction;
   if (info->specialprimode == 1)
     t->priority = (info->priority & 0xFFFFFFFE) | info->specialfunction;
@@ -2801,8 +2729,8 @@ typedef struct {
   int linescreen, id, colornumber, mosaicxmask, mosaicymask, specialprimode, specialcolormode;
   u64 lineTexture;
   u8 LogicWin, bEnWin0, bEnWin1, WindowArea0, WindowArea1, bEnSpriteWin, WindowAreaSprite;
-} KeKachelFelder;
-static void KeKachelPacken(const vdp2draw_struct *t, KeKachelFelder *k) {
+} TlTileFields;
+static void TlTilePack(const vdp2draw_struct *t, TlTileFields *k) {
   memset(k, 0, sizeof(*k));
   memcpy(k->vertices, t->vertices, sizeof(k->vertices));
   k->cellw = t->cellw; k->cellh = t->cellh; k->flipfunction = t->flipfunction; k->priority = t->priority;
@@ -2814,36 +2742,32 @@ static void KeKachelPacken(const vdp2draw_struct *t, KeKachelFelder *k) {
   k->WindowArea0 = t->WindowArea0; k->WindowArea1 = t->WindowArea1;
   k->bEnSpriteWin = t->bEnSpriteWin; k->WindowAreaSprite = t->WindowAreaSprite;
 }
-static void KeKachelVergleich(const vdp2draw_struct *alt, const vdp2draw_struct *info, int x, int y, int lines) {
-  KeKachelFelder ka, kn;
-  const vdp2draw_struct *neu = KeKachel(info, x, y, lines);
-  KeKachelPacken(alt, &ka);
-  KeKachelPacken(neu, &kn);
+static void TlTileCompare(const vdp2draw_struct *prev_val, const vdp2draw_struct *info, int x, int y, int lines) {
+  TlTileFields ka, kn;
+  const vdp2draw_struct *new_val = TlTile(info, x, y, lines);
+  TlTilePack(prev_val, &ka);
+  TlTilePack(new_val, &kn);
   if (memcmp(&ka, &kn, sizeof(ka)) != 0) {
-    g_ke_vorlage_ok = 0;   /* refill the template from info */
+    g_tl_template_ok = 0;   /* refill the template from info */
   }
 }
 
 /* Left wrap column fix for continuous scrolling of -1..-16 in 352-pixel mode.
    Per NBG layer: TVMD & 7 in {1,5} (352 pixels), integer part (SCXINx/SCXNx & 0x7FF) in 0x7F0..0x7FF, fraction
-   register (SCXDNx, whole word) == 0, and the same value in RANDSCROLL_KONST consecutive drawn frames
+   register (SCXDNx, whole word) == 0, and the same value in EDGESCROLL_CONST consecutive drawn frames
    (otherwise it cannot be told from real scrolling over a 2048-wide map); then N = 0x800 - value (1..16) columns
    on the left are hidden. Register source: fixVdp2Regs (line 0 snapshot, like the drawing paths).
-   g_rs_n[] is set per frame in Vdp2DrawScreensNbg; g_rs_akt is N of the layer currently drawn by Vdp2DrawMapTest,
+   g_rs_n[] is set per frame in Vdp2DrawScreensNbg; g_es_active is N of the layer currently drawn by Vdp2DrawMapTest,
    or 0 if the drawing path is not covered. */
 #include <time.h>
-#define RANDSCROLL_KONST 3
-static int g_rs_akt = 0;                  /* N of the layer currently drawn (tile path), 0 = no intervention */
+#define EDGESCROLL_CONST 3
+static int g_es_active = 0;                  /* N of the layer currently drawn (tile path), 0 = no intervention */
 static int g_rs_n[4] = {0, 0, 0, 0};      /* N per NBG layer in this frame, 0 = condition not met */
-static u32 g_rs_wert[4] = {0, 0, 0, 0};
-static u32 g_rs_konst[4] = {0, 0, 0, 0};  /* consecutive frames with the same value (including the current one) */
-/* Always on: hides the wrapped left column(s) under continuous scrolling of -1..-16 in 352-pixel mode. */
-static int RandScrollAn(void) {
-  return 1;
-}
+static u32 g_es_value[4] = {0, 0, 0, 0};
+static u32 g_es_const[4] = {0, 0, 0, 0};  /* consecutive frames with the same value (including the current one) */
+/* Hides the wrapped left column(s) under continuous scrolling of -1..-16 in 352-pixel mode. */
 /* Called once per frame (Vdp2DrawScreensNbg). */
-static void RandScrollBild(void) {
-  if (!RandScrollAn()) return;
+static void EdgeScrollFrame(void) {
   const u16 tvmd = fixVdp2Regs->TVMD;
   const int h352 = ((tvmd & 0x7) == 1 || (tvmd & 0x7) == 5);
   const u16 in[4] = { fixVdp2Regs->SCXIN0, fixVdp2Regs->SCXIN1, fixVdp2Regs->SCXN2, fixVdp2Regs->SCXN3 };
@@ -2851,23 +2775,23 @@ static void RandScrollBild(void) {
   for (int i = 0; i < 4; i++) {
     const u32 v = in[i] & 0x7FF;
     const u32 w = (v << 16) | dn[i];
-    if (g_rs_konst[i] != 0 && w == g_rs_wert[i]) { if (g_rs_konst[i] < 0x7FFFFFFFu) g_rs_konst[i]++; }
-    else { g_rs_wert[i] = w; g_rs_konst[i] = 1; }
-    g_rs_n[i] = (h352 && v >= 0x7F0 && dn[i] == 0 && g_rs_konst[i] >= RANDSCROLL_KONST) ? (int)(0x800 - v) : 0;
+    if (g_es_const[i] != 0 && w == g_es_value[i]) { if (g_es_const[i] < 0x7FFFFFFFu) g_es_const[i]++; }
+    else { g_es_value[i] = w; g_es_const[i] = 1; }
+    g_rs_n[i] = (h352 && v >= 0x7F0 && dn[i] == 0 && g_es_const[i] >= EDGESCROLL_CONST) ? (int)(0x800 - v) : 0;
   }
 }
-/* Gate per drawing path: N if the condition holds and the path is exactly covered, otherwise 0 (uncovered cases are counted). */
-static int RandScrollTor(int id, int gedeckt) {
+/* Gate per drawing path: N if the condition holds and the path is exactly covered, otherwise 0. */
+static int EdgeScrollGate(int id, int covered) {
   const int n = g_rs_n[id & 3];
   if (!n) return 0;
-  if (!gedeckt) return 0;
+  if (!covered) return 0;
   return n;
 }
 
 static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x, int y, int cx, int cy, int lines )
 {
   /* tile lies entirely left of the boundary N: wrapped column, discard */
-  if (g_rs_akt && x + info->patternpixelwh <= g_rs_akt) return;
+  if (g_es_active && x + info->patternpixelwh <= g_es_active) return;
   /* Tile cache key: priority, alpha, palette address, character address, transparency, pattern size and color offset. */
   u64 cacheaddr = (((u64)(info->priority&0xF))<<35) | ((u32)(info->alpha >> 3) << 27) |
     (info->paladdr << 20) | info->charaddr | info->transparencyenable |
@@ -2877,9 +2801,9 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
   vdp2draw_struct tile;
   vdp2draw_struct *tp_ = &tile;   /* tile used for drawing */
   int winmode = 0;
-  if (g_ke_modus == 1) {   /* template per layer, only vertices/flip/priority per tile */
-    tp_ = KeKachel(info, x, y, lines);
-    goto ke_kachel_fertig_;
+  if (g_tl_mode == 1) {   /* template per layer, only vertices/flip/priority per tile */
+    tp_ = TlTile(info, x, y, lines);
+    goto tl_tile_done_;
   }
   tile.dst = 0;
   tile.uclipmode = 0;
@@ -2897,13 +2821,8 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
   tile.LogicWin = info->LogicWin;
   tile.lineTexture = info->lineTexture;
   tile.id = info->id;
-  if (KachelSpezAn()) {
-    tile.specialprimode = info->specialprimode;
-    tile.specialcolormode = info->specialcolormode;
-  } else {
-    tile.specialprimode = 0;
-    tile.specialcolormode = 0;
-  }
+  tile.specialprimode = info->specialprimode;
+  tile.specialcolormode = info->specialcolormode;
 
   tile.cellw = tile.cellh = info->patternpixelwh;
   tile.flipfunction = info->flipfunction;
@@ -2921,7 +2840,7 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
   tile.vertices[5] = (y + lines /*(float)info->lineinc*/);
   tile.vertices[6] = x;
   tile.vertices[7] = (y + lines/*(float)info->lineinc*/ );
-ke_kachel_fertig_:
+tl_tile_done_:
 
   // Screen culling
   //if (tile.vertices[0] >= vdp2width || tile.vertices[1] >= vdp2height || tile.vertices[2] < 0 || tile.vertices[5] < 0)
@@ -2942,7 +2861,7 @@ ke_kachel_fertig_:
   tp_->cog = info->cog;
   tp_->cob = info->cob;
   /* Compare only here: the old path sets cor/cog/cob after the window check; earlier they would be uninitialised. */
-  if (g_ke_modus == 2) KeKachelVergleich(&tile, info, x, y, lines);
+  if (g_tl_mode == 2) TlTileCompare(&tile, info, x, y, lines);
 
   // Texture cache persistence: give the source range of the tile in VDP2 VRAM for stamp validation
   // (the palette lives in CRAM and needs no invalidation -- tiles store color indices, the shader resolves them).
@@ -2962,14 +2881,14 @@ ke_kachel_fertig_:
   if (1 == YglIsCached(_Ygl->texture_manager, cacheaddr, &c))
   {
     //printf("x=%d,y=%d %lx cached\n",x,y,cacheaddr);
-    if (g_ke_modus) YglKachelQuad(tp_, NULL, &c, cx, cy, info->coordincx, info->coordincy, 0, g_ke_modus);
+    if (g_tl_mode) YglTileQuad(tp_, NULL, &c, cx, cy, info->coordincx, info->coordincy, 0, g_tl_mode);
     else
     YglCachedQuadOffset(&tile, &c, cx, cy, info->coordincx, info->coordincy);
     return;
   }
 
   //printf("x=%d,y=%d %lx not cached\n",x,y,cacheaddr);
-  if (g_ke_modus) YglKachelQuad(tp_, texture, &c, cx, cy, info->coordincx, info->coordincy, 1, g_ke_modus);
+  if (g_tl_mode) YglTileQuad(tp_, texture, &c, cx, cy, info->coordincx, info->coordincy, 1, g_tl_mode);
   else
   YglQuadOffset(&tile, texture, &c, cx, cy, info->coordincx, info->coordincy);
   YglCacheAdd(_Ygl->texture_manager, cacheaddr, &c);
@@ -3304,22 +3223,22 @@ static INLINE u32 Vdp2RotationFetchPixel(vdp2draw_struct *info, int x, int y, in
    per pixel; horizontal mirroring = nibble/byte reversal; a fully transparent cell row (word 0 with
    transparencyenable) yields a block of zeros. Color calculation as in Vdp2RotationFetchPixel cases 0/1.
    Alignment: charaddr = name*0x20, row 4*yy / 8*yy, so the 4/8 bytes are contiguous and never cross 0x80000. */
-#define PLWORT_FALL(i) ((i)->specialprimode != 2 && ((i)->colornumber == 0 || (i)->colornumber == 1) && (i)->cellw == 8 && ((i)->charaddr & 0x7) == 0)
-static INLINE u32 PlWortLese32(u32 a) {   /* 4 bytes, logical order as in T1ReadLong (byte 0 on top) */
+#define PLWORD_CASE(i) ((i)->specialprimode != 2 && ((i)->colornumber == 0 || (i)->colornumber == 1) && (i)->cellw == 8 && ((i)->charaddr & 0x7) == 0)
+static INLINE u32 PlWordRead32(u32 a) {   /* 4 bytes, logical order as in T1ReadLong (byte 0 on top) */
   u32 w; memcpy(&w, Vdp2RamRender + (a & 0x7FFFF), 4);
 #ifndef WORDS_BIGENDIAN
   w = __builtin_bswap32(w);
 #endif
   return w;
 }
-static INLINE u64 PlWortLese64(u32 a) {   /* 8 bytes, byte 0 on top */
+static INLINE u64 PlWordRead64(u32 a) {   /* 8 bytes, byte 0 on top */
   u64 q; memcpy(&q, Vdp2RamRender + (a & 0x7FFFF), 8);
 #ifndef WORDS_BIGENDIAN
   q = __builtin_bswap64(q);
 #endif
   return q;
 }
-static INLINE u32 PlWortFarbe(u32 dot, u32 co, u32 pl, u32 a24, int te, int scm, int scf, u32 scode) {
+static INLINE u32 PlWordColor(u32 dot, u32 co, u32 pl, u32 a24, int te, int scm, int scf, u32 scode) {
   if (!dot && te) return 0x00000000u;
   {
     const u32 ci = co + (pl | dot);
@@ -3336,7 +3255,7 @@ static INLINE u32 PlWortFarbe(u32 dot, u32 co, u32 pl, u32 a24, int te, int scm,
   }
 }
 /* One run = pixels charx0 .. charx0+lauf-1 of ONE pattern (8 or 16 wide), state from Vdp2PatternAddrPos. */
-static INLINE u32 *PlWortLauf(const vdp2draw_struct *info, int charx0, int chary, int lauf, u32 *out)
+static INLINE u32 *PlWordRun(const vdp2draw_struct *info, int charx0, int chary, int run_len, u32 *out)
 {
   const int cn = info->colornumber, ff = info->flipfunction, pwh = info->patternwh;
   const u32 ca = info->charaddr, co = (u32)info->coloroffset;
@@ -3344,7 +3263,7 @@ static INLINE u32 *PlWortLauf(const vdp2draw_struct *info, int charx0, int chary
   const int te = info->transparencyenable;
   const int scm = info->specialcolormode, scf = info->specialcolorfunction;
   const u32 scode = (u32)info->specialcode;
-  int ybasis;   /* row in the cell block without horizontal cell selection (as in PL_ZEILE_ALT) */
+  int ybasis;   /* row in the cell block without horizontal cell selection (as in PL_LINE_OLD) */
   if (pwh == 1) {
     ybasis = chary & 7;
     if (ff & 0x2) ybasis = 7 - ybasis;
@@ -3354,18 +3273,18 @@ static INLINE u32 *PlWortLauf(const vdp2draw_struct *info, int charx0, int chary
     else if (ybasis & 8) ybasis += 8;
   }
   int k = 0;
-  while (k < lauf) {
+  while (k < run_len) {
     const int cx = charx0 + k;          /* pixel in the pattern */
     const int xs = cx & 7;              /* start in the cell */
     int n = 8 - xs;
-    if (n > lauf - k) n = lauf - k;
+    if (n > run_len - k) n = run_len - k;
     int yy = ybasis;
     if (pwh != 1) {                     /* 2x2 pattern: right/left cell */
       if (ff & 0x1) { if (!(cx & 8)) yy += 8; }
       else if (cx & 8) yy += 8;
     }
     if (cn == 0) {
-      u32 w = PlWortLese32(ca + (u32)yy * 4);
+      u32 w = PlWordRead32(ca + (u32)yy * 4);
       if (ff & 0x1) {                   /* nibble reversal: pixel x <-> 7-x */
         w = __builtin_bswap32(w);
         w = ((w & 0x0F0F0F0Fu) << 4) | ((w >> 4) & 0x0F0F0F0Fu);
@@ -3378,11 +3297,11 @@ static INLINE u32 *PlWortLauf(const vdp2draw_struct *info, int charx0, int chary
         if (scm == 0) {                 /* most common case: no per-pixel color special case */
           for (int i = 0; i < n; i++) { const u32 d = w >> 28; *out++ = (d || !te) ? ((co + (pl | d)) | a24) : 0x00000000u; w <<= 4; }
         } else {
-          for (int i = 0; i < n; i++) { *out++ = PlWortFarbe(w >> 28, co, pl, a24, te, scm, scf, scode); w <<= 4; }
+          for (int i = 0; i < n; i++) { *out++ = PlWordColor(w >> 28, co, pl, a24, te, scm, scf, scode); w <<= 4; }
         }
       }
     } else {
-      u64 q = PlWortLese64(ca + (u32)yy * 8);
+      u64 q = PlWordRead64(ca + (u32)yy * 8);
       if (ff & 0x1) q = __builtin_bswap64(q);   /* byte reversal: pixel x <-> 7-x */
       q <<= 8 * xs;
       if (te && (q >> (64 - 8 * n)) == 0) {
@@ -3392,7 +3311,7 @@ static INLINE u32 *PlWortLauf(const vdp2draw_struct *info, int charx0, int chary
         if (scm == 0) {
           for (int i = 0; i < n; i++) { const u32 d = (u32)(q >> 56); *out++ = (d || !te) ? ((co + (pl | d)) | a24) : 0x00000000u; q <<= 8; }
         } else {
-          for (int i = 0; i < n; i++) { *out++ = PlWortFarbe((u32)(q >> 56), co, pl, a24, te, scm, scf, scode); q <<= 8; }
+          for (int i = 0; i < n; i++) { *out++ = PlWordColor((u32)(q >> 56), co, pl, a24, te, scm, scf, scode); q <<= 8; }
         }
       }
     }
@@ -3401,27 +3320,12 @@ static INLINE u32 *PlWortLauf(const vdp2draw_struct *info, int charx0, int chary
   return out;
 }
 #include <time.h>
-static int PlWortAn(void) {
-  static int s = -1;
-  if (s < 0) { s = 1; }   /* fixed on */
-  return s;
-}
-
-static int g_plschnell = -1;
-static INLINE int PlSchnellModus(void) {
-  if (g_plschnell < 0) {
-    g_plschnell = 1;   /* fixed: per-cell path */
-  }
-  return g_plschnell;
-}
-#define PL_ZEILE_ALT { \
+#define PL_LINE_OLD { \
     for (int j = 0; j < info->draww; j += 1) { \
        \
       int h = ((j*inch) >> 8); \
  \
-      /*mapx = (h + sx) / (512 * info->planew); */ \
       mapx = (h + sx) >> planew_shift; \
-      /*int dot_on_planex = (h + sx) - mapx*(512 * info->planew); */ \
       dot_on_planex = (h + sx) - (mapx << planew_shift); \
       mapx = mapx & 0x01; \
  \
@@ -3431,14 +3335,10 @@ static INLINE int PlSchnellModus(void) {
         premapid = mapid; \
       } \
  \
-      /*planex = dot_on_planex / 512; */ \
       planex = dot_on_planex >> plane_shift; \
-      /*int dot_on_pagex = dot_on_planex - planex * 512; */ \
       dot_on_pagex = dot_on_planex & plane_mask; \
       planex = planex & (info->planew - 1); \
-      /*pagex = dot_on_pagex / (512 / info->pagewh); */ \
       pagex = dot_on_pagex >> page_shift; \
-      /*charx = dot_on_pagex - pagex*(512 / info->pagewh); */ \
       charx = dot_on_pagex & page_mask; \
       if (pagex < 0) pagex = info->pagewh - 1 + pagex; \
  \
@@ -3512,10 +3412,10 @@ static INLINE int PlSchnellModus(void) {
  \
     } \
 }
-#define PL_ZEILE_NEU { \
+#define PL_LINE_NEW { \
  \
     if (inch != 256) { \
-      PL_ZEILE_ALT \
+      PL_LINE_OLD \
     } else { \
       int j = 0; \
       int hx = sx;   /* h == j when inch == 256 */ \
@@ -3545,13 +3445,13 @@ static INLINE int PlSchnellModus(void) {
           prepagey = pagey; \
         } \
  \
-        int lauf = page_mask - charx0 + 1; \
-        if (lauf > info->draww - j) lauf = info->draww - j; \
+        int run_len = page_mask - charx0 + 1; \
+        if (run_len > info->draww - j) run_len = info->draww - j; \
         /* Most common case (4/8 bpp palette, no special priority 2, no special color calculation) with the cell values \
            in local variables, otherwise the compiler reloads info->... for every pixel (aliasing with the texture \
            writes). Same as Vdp2RotationFetchPixel, cases 0/1 with specialcolormode 0. */ \
-        if (plw_ && PLWORT_FALL(info)) {   /* one word read per cell row */ \
-          texture->textdata = PlWortLauf(info, charx0, chary, lauf, texture->textdata); \
+        if (PLWORD_CASE(info)) {   /* one word read per cell row */ \
+          texture->textdata = PlWordRun(info, charx0, chary, run_len, texture->textdata); \
         } else if (info->specialprimode != 2 && \
             (info->colornumber == 0 || info->colornumber == 1)) {   /* all specialcolormode 0-3 */ \
           const int pp_cn = info->colornumber; \
@@ -3561,7 +3461,7 @@ static INLINE int PlSchnellModus(void) {
           const int pp_scm = info->specialcolormode, pp_scf = info->specialcolorfunction; \
           const u32 pp_scode = info->specialcode; \
           u32 *pp_out = texture->textdata; \
-          for (int k = 0; k < lauf; k++) { \
+          for (int k = 0; k < run_len; k++) { \
             int charx = charx0 + k; \
           int x = charx; \
           int y = chary; \
@@ -3647,7 +3547,7 @@ static INLINE int PlSchnellModus(void) {
           } \
           texture->textdata = pp_out; \
         } else { \
-          for (int k = 0; k < lauf; k++) { \
+          for (int k = 0; k < run_len; k++) { \
             int charx = charx0 + k; \
           int x = charx; \
           int y = chary; \
@@ -3711,8 +3611,8 @@ static INLINE int PlSchnellModus(void) {
             *texture->textdata++ = Vdp2RotationFetchPixel(info, x, y, info->cellw); \
           } \
         } \
-        j += lauf; \
-        hx += lauf; \
+        j += run_len; \
+        hx += run_len; \
       } \
     } \
 }
@@ -3720,19 +3620,10 @@ static INLINE int PlSchnellModus(void) {
    line only; space and texture are half as high and the quad keeps full height (the GPU stretches it), like in the
    bitmap path. This halves the CPU rasterising cost and the texture upload at the price of half vertical
    resolution in these backgrounds only (VDP1/3D are unaffected). Controlled by the game config `interlace half`. */
-int g_interhalb_menue = 0;   /* game config `interlace half`, set from main.cpp/MenuScreen.cpp, live */
-static int InterHalbAn(void) {
-  static int env = -2;
-  if (env == -2) { env = -1; }
-  const int an = (env >= 0) ? env : (g_interhalb_menue != 0);
-  return an;
-}
-int InterHalbAktiv(void) { return InterHalbAn(); }   /* used by ygles.c */
+int g_interlace_half_menu = 0;   /* game config `interlace half`, set from main.cpp/MenuScreen.cpp, live */
+int InterlaceHalfActive(void) { return g_interlace_half_menu != 0; }   /* also used by ygles.c */
 
 static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
-  NBGWEG(info, 2);
-  const int plw_ = PlWortAn();
-
   int lineindex = 0;
 
   int sx; //, sy;
@@ -3788,7 +3679,7 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
   }
 
 
-  const int ih_ = InterHalbAn() && vdp2height >= 448;
+  const int ih_ = InterlaceHalfActive() && vdp2height >= 448;
   for (v = 0; v < vdp2height; v += (ih_ ? 2 : 1)) {  // ToDo: info->coordincy
     if (ih_) lineindex = v / (linemask + 1);   /* line group as with the full step size */
 
@@ -3849,42 +3740,9 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
     int inch = 1.0 / info->coordincx*256.0;
 
     /* Cell-wise rasterising: without H zoom (inch == 256) mapid/planex/pagex stay constant inside a cell (8 or 16
-           pixels; cell boundaries are multiples of that, also for negative X because of arithmetic shifts), so the
-           decomposition and comparison are done once per cell, then the pixels of the cell. The pixel values are
-           unchanged (same flip logic, same Vdp2RotationFetchPixel), so the result is bit-identical by construction.
-           Mode 2 computes both, compares line by line, reports differences and uses the old output. */
-    {
-      const int plmodus = PlSchnellModus();
-      u32 *zeile_ziel = texture->textdata;
-      if (plmodus == 2) {
-        /* comparison mode: save state, run the old path, restore, run the new path. */
-        static u32 puf_alt[2048], puf_neu[2048];
-        vdp2draw_struct info_s; memcpy(&info_s, info, sizeof(info_s));
-        int s_premapid = premapid, s_px = preplanex, s_py = preplaney, s_gx = prepagex, s_gy = prepagey;
-        if (info->draww <= 2048) {
-          texture->textdata = puf_alt;
-          PL_ZEILE_ALT
-          vdp2draw_struct info_a; memcpy(&info_a, info, sizeof(info_a));
-          int a_premapid = premapid, a_px = preplanex, a_py = preplaney, a_gx = prepagex, a_gy = prepagey;
-          memcpy(info, &info_s, sizeof(info_s));
-          premapid = s_premapid; preplanex = s_px; preplaney = s_py; prepagex = s_gx; prepagey = s_gy;
-          texture->textdata = puf_neu;
-          PL_ZEILE_NEU
-          /* the old result is used: take over its state */
-          memcpy(info, &info_a, sizeof(info_a));
-          premapid = a_premapid; preplanex = a_px; preplaney = a_py; prepagex = a_gx; prepagey = a_gy;
-          memcpy(zeile_ziel, puf_alt, info->draww * 4);
-          texture->textdata = zeile_ziel + info->draww;
-        } else {
-          texture->textdata = zeile_ziel;
-          PL_ZEILE_ALT
-        }
-      } else if (plmodus == 1) {
-        PL_ZEILE_NEU
-      } else {
-        PL_ZEILE_ALT
-      }
-    }
+       pixels; cell boundaries are multiples of that, also for negative X because of arithmetic shifts), so the
+       decomposition and comparison are done once per cell, then the pixels of the cell. */
+    PL_LINE_NEW
     if((v & linemask) == linemask) lineindex++;
     texture->textdata += texture->w;
   }
@@ -3892,9 +3750,6 @@ static void Vdp2DrawMapPerLine(vdp2draw_struct *info, YglTexture *texture) {
 }
 
 void Vdp2DrawMapPerLineNbg23(vdp2draw_struct *info, YglTexture *texture, int id, int xoffset ) {
-  NBGWEG(info, 8);
-  const int plw_ = PlWortAn();
-  const int plv_ = plw_ && PlSchnellModus() == 2;   /* comparison per run */
 
   int sx; //, sy;
   int mapx, mapy;
@@ -3965,100 +3820,7 @@ void Vdp2DrawMapPerLineNbg23(vdp2draw_struct *info, YglTexture *texture, int id,
     chary = dot_on_pagey & page_mask;
     if (pagey < 0) pagey = info->pagewh - 1 + pagey;
 
-    if (PlSchnellModus() != 1 && !plv_) {   /* 0/2 = old pixel loop; the comparison runs cell by cell */
-    for (int j = 0; j < info->draww; j += 1) {
-      
-      //mapx = (h + sx) / (512 * info->planew);
-      mapx = (j + sx) >> planew_shift;
-      //int dot_on_planex = (h + sx) - mapx*(512 * info->planew);
-      dot_on_planex = (j + sx) - (mapx << planew_shift);
-      mapx = mapx & 0x01;
-
-      mapid = info->mapwh * mapy + mapx;
-      if (mapid != premapid) {
-        info->PlaneAddr(info, mapid, fixVdp2Regs);
-        premapid = mapid;
-      }
-
-      //planex = dot_on_planex / 512;
-      planex = dot_on_planex >> plane_shift;
-      //int dot_on_pagex = dot_on_planex - planex * 512;
-      dot_on_pagex = dot_on_planex & plane_mask;
-      planex = planex & (info->planew - 1);
-      //pagex = dot_on_pagex / (512 / info->pagewh);
-      pagex = dot_on_pagex >> page_shift;
-      //charx = dot_on_pagex - pagex*(512 / info->pagewh);
-      charx = dot_on_pagex & page_mask;
-      if (pagex < 0) pagex = info->pagewh - 1 + pagex;
-
-      if (planex != preplanex || pagex != prepagex || planey != preplaney || pagey != prepagey) {
-        Vdp2PatternAddrPos(info, planex, pagex, planey, pagey);
-        preplanex = planex;
-        preplaney = planey;
-        prepagex = pagex;
-        prepagey = pagey;
-      }
-
-      int x = charx;
-      int y = chary;
-
-      if (info->patternwh == 1)
-      {
-        x &= 8 - 1;
-        y &= 8 - 1;
-
-        // vertical flip
-        if (info->flipfunction & 0x2)
-          y = 8 - 1 - y;
-
-        // horizontal flip	
-        if (info->flipfunction & 0x1)
-          x = 8 - 1 - x;
-      }
-      else
-      {
-        if (info->flipfunction)
-        {
-          y &= 16 - 1;
-          if (info->flipfunction & 0x2)
-          {
-            if (!(y & 8))
-              y = 8 - 1 - y + 16;
-            else
-              y = 16 - 1 - y;
-          }
-          else if (y & 8)
-            y += 8;
-
-          if (info->flipfunction & 0x1)
-          {
-            if (!(x & 8))
-              y += 8;
-
-            x &= 8 - 1;
-            x = 8 - 1 - x;
-          }
-          else if (x & 8)
-          {
-            y += 8;
-            x &= 8 - 1;
-          }
-          else
-            x &= 8 - 1;
-        }
-        else
-        {
-          y &= 16 - 1;
-          if (y & 8)
-            y += 8;
-          if (x & 8)
-            y += 8;
-          x &= 8 - 1;
-        }
-      }
-      *texture->textdata++ = Vdp2RotationFetchPixel(info, x, y, info->cellw);
-    }
-    } else {
+    {
       /* Cell-wise processing: there is no H zoom here (h == j always); bit-identical to the pixel path by construction. */
       int j = 0;
       int hx = sx;
@@ -4084,13 +3846,12 @@ void Vdp2DrawMapPerLineNbg23(vdp2draw_struct *info, YglTexture *texture, int id,
           prepagex = pagex;
           prepagey = pagey;
         }
-        int lauf = page_mask - charx0 + 1;
-        if (lauf > info->draww - j) lauf = info->draww - j;
-        const int plw_fall_ = plw_ && PLWORT_FALL(info);
-        if (plw_fall_ && !plv_) {
-          texture->textdata = PlWortLauf(info, charx0, chary, lauf, texture->textdata);
+        int run_len = page_mask - charx0 + 1;
+        if (run_len > info->draww - j) run_len = info->draww - j;
+        if (PLWORD_CASE(info)) {
+          texture->textdata = PlWordRun(info, charx0, chary, run_len, texture->textdata);
         } else {
-        for (int k = 0; k < lauf; k++) {
+        for (int k = 0; k < run_len; k++) {
           int charx = charx0 + k;
           int x = charx;
           int y = chary;
@@ -4153,8 +3914,8 @@ void Vdp2DrawMapPerLineNbg23(vdp2draw_struct *info, YglTexture *texture, int id,
           *texture->textdata++ = Vdp2RotationFetchPixel(info, x, y, info->cellw);
         }
         }
-        j += lauf;
-        hx += lauf;
+        j += run_len;
+        hx += run_len;
       }
     }
     texture->textdata += texture->w;
@@ -4164,8 +3925,7 @@ void Vdp2DrawMapPerLineNbg23(vdp2draw_struct *info, YglTexture *texture, int id,
 
 
 static void Vdp2DrawMapTest(vdp2draw_struct *info, YglTexture *texture) {
-  NBGWEG(info, 4);
-  KachelEbeneBeginn();   /* start of the layer: invalidate the template, new program memo generation */
+  TileLayerBegin();   /* start of the layer: invalidate the template, new program memo generation */
 
   int lineindex = 0;
 
@@ -4367,10 +4127,10 @@ void Vdp2DrawRotationThread(void * p) {
 
   printf("Vdp2DrawRotationThread\n");
   /* the thread affinity is set once, not on every iteration (see vdp2.cpp) */
-  int rot_gebunden = 0;
+  int rot_bound = 0;
   while (Vdp2DrawRotationThread_running) {
-    if (YabaKernModus() != 3 && (YabaKernModus() == 0 || !rot_gebunden)) {
-      rot_gebunden = 1;
+    if (!rot_bound) {
+      rot_bound = 1;
       YabThreadSetCurrentThreadAffinityMask(0x02);
     }
     YabThreadLock(g_rotate_mtx);
@@ -4552,7 +4312,7 @@ static void FASTCALL Vdp2DrawRotation(RBGDrawInfo * rbg)
    if (info->LineColorBase != 0)
    {
      rbg->line_info.blendmode = 0;
-     rbg->LineColorRamAdress = (T1ReadWord(Vdp2RamRender, info->LineColorBase) & 0x7FF);// +info->coloroffset;
+     rbg->LineColorRamAdress = (T1ReadWord(Vdp2RamRender, info->LineColorBase) & 0x7FF);
 
      u64 cacheaddr = 0xA0000000DAD ^ (((u64)rbg->rgb_type + 1) << 44);   /* distinct key for g_rgb0/g_rgb1 */
      RbgSlotAllocate(cacheaddr, &rbg->line_texture, &rbg->cline, rbg->vres, 1, &x, &y);
@@ -4594,7 +4354,7 @@ static void FASTCALL Vdp2DrawRotation(RBGDrawInfo * rbg)
 	if (info->LineColorBase != 0)
 	{
 		rbg->line_info.blendmode = 0;
-		rbg->LineColorRamAdress = (T1ReadWord(Vdp2RamRender, info->LineColorBase) & 0x7FF);// +info->coloroffset;
+		rbg->LineColorRamAdress = (T1ReadWord(Vdp2RamRender, info->LineColorBase) & 0x7FF);
 
 		u64 cacheaddr = 0xA0000000DAD ^ (((u64)rbg->rgb_type + 1) << 44);   /* distinct key for g_rgb0/g_rgb1 */
 		RbgSlotAllocate(cacheaddr, &rbg->line_texture, &rbg->cline, rbg->vres, 1, &x, &y);
@@ -5402,9 +5162,9 @@ void VIDOGLVdp1DrawStart(void)
      invalidates cached sprites after a register change. It only changes on a real change. */
   {
     extern u32 g_vdp1_decode_gen;
-    static u32 letzte_kennung = 0xFFFFFFFFu;
-    u32 kennung = ((u32)fixVdp2Regs->SPCTL << 16) ^ (u32)fixVdp2Regs->CCCTL;
-    if (kennung != letzte_kennung) { letzte_kennung = kennung; g_vdp1_decode_gen++; }
+    static u32 last_id = 0xFFFFFFFFu;
+    u32 id_val = ((u32)fixVdp2Regs->SPCTL << 16) ^ (u32)fixVdp2Regs->CCCTL;
+    if (id_val != last_id) { last_id = id_val; g_vdp1_decode_gen++; }
   }
 
   u8 *sprprilist = (u8 *)&fixVdp2Regs->PRISA;
@@ -5462,14 +5222,14 @@ void VIDOGLVdp1DrawEnd(void)
 #define IS_REPLACE_OR_HALF_TRANSPARENT(a) ((a&0x03)==0x03)
 
 /* Opaque fast path: sprites whose texture is known to contain no alpha-0 texel use a discard-free SPD program. */
-static int s_opakfast_enabled = -1;
+static int s_opaquefast_enabled = -1;
 
-static int YglOpakFastEnabled(void)
+static int YglOpaqueFastEnabled(void)
 {
-  if (s_opakfast_enabled < 0) {
-    s_opakfast_enabled = 1;   /* fixed on */
+  if (s_opaquefast_enabled < 0) {
+    s_opaquefast_enabled = 1;   /* fixed on */
   }
-  return s_opakfast_enabled;
+  return s_opaquefast_enabled;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -5515,7 +5275,9 @@ void VIDOGLVdp1NormalSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
   sprite.w = ((cmd.CMDSIZE >> 8) & 0x3F) * 8;
   sprite.h = cmd.CMDSIZE & 0xFF;
   if (sprite.w == 0 || sprite.h == 0) {
-    return; //bad command
+    /* zero width/height draws as 1 instead of being dropped (Kronos) */
+    if (sprite.w == 0) sprite.w = 1;
+    if (sprite.h == 0) sprite.h = 1;
   }
 
   sprite.flip = (cmd.CMDCTRL & 0x30) >> 4;
@@ -5584,7 +5346,7 @@ void VIDOGLVdp1NormalSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
     sprite.blendmode = VDP1_COLOR_CL_MESH;
   }
 
-  if ((CMDPMOD & 4) && !GouraudOhneWirkung(CMDPMOD))
+  if ((CMDPMOD & 4) && !GouraudNoEffect(CMDPMOD))
   {
     for (i = 0; i < 4; i++)
     {
@@ -5602,7 +5364,7 @@ void VIDOGLVdp1NormalSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
         // Opaque fast path: on a cache hit the flag from the previous decode of this exact texture is known
         // (key tmp = CMDSRCA/CMDCOLR/CMDSIZE/CMDPMOD). Only pure REPLACE (no shadow/mesh/half-transparency/half-luminance)
         // with no alpha-0 texel uses the discard-free SPD program; otherwise the normal path is used.
-        if (YglOpakFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE && cash.no_alpha0) {
+        if (YglOpaqueFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE && cash.no_alpha0) {
           sprite.blendmode = VDP1_COLOR_SPD;
         }
         if (cmd.CMDPMOD & 0x8000) _Ygl->msb_shadow_count_[_Ygl->drawframe]++;
@@ -5617,7 +5379,7 @@ void VIDOGLVdp1NormalSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       {
         u8 p2_no_alpha0 = 0;
         Vdp1ReadTexture(&cmd, &sprite, &texture, &p2_no_alpha0);
-        cash.no_alpha0 = (YglOpakFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE) ? p2_no_alpha0 : 0;
+        cash.no_alpha0 = (YglOpaqueFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE) ? p2_no_alpha0 : 0;
         /* Switch to SPD on a cache miss as well, as soon as the flag is known: otherwise the same sprite would get a
            different shader program (and drawing order position) depending on the cache state, which shows as flicker
            on overlapping polygons. */
@@ -5635,7 +5397,7 @@ void VIDOGLVdp1NormalSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       if (1 == YglIsCached(_Ygl->texture_manager, tmp, &cash))
       {
         // opaque fast path: see the Gouraud branch above
-        if (YglOpakFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE && cash.no_alpha0) {
+        if (YglOpaqueFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE && cash.no_alpha0) {
           sprite.blendmode = VDP1_COLOR_SPD;
         }
         if (cmd.CMDPMOD & 0x8000) _Ygl->msb_shadow_count_[_Ygl->drawframe]++;
@@ -5650,7 +5412,7 @@ void VIDOGLVdp1NormalSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       {
         u8 p2_no_alpha0 = 0;
         Vdp1ReadTexture(&cmd, &sprite, &texture, &p2_no_alpha0);
-        cash.no_alpha0 = (YglOpakFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE) ? p2_no_alpha0 : 0;
+        cash.no_alpha0 = (YglOpaqueFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE) ? p2_no_alpha0 : 0;
         /* Switch to SPD on a cache miss as well, as soon as the flag is known: otherwise the same sprite would get a
            different shader program (and drawing order position) depending on the cache state, which shows as flicker
            on overlapping polygons. */
@@ -5667,8 +5429,7 @@ void VIDOGLVdp1ScaledSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
 {
   vdp1cmd_struct cmd;
   YglSprite sprite;
-  /* id/cor/cog/cob must be initialised: they enter the batching decision as comparison values, and uninitialised
-     stack made almost every sprite force its own draw call. id is additionally set to the texture hash below where available. */
+  /* id/cor/cog/cob: see VIDOGLVdp1NormalSpriteDraw */
   sprite.id = 0;   /* final value is set right before the draw call, see BatchId() */
   sprite.cor = sprite.cog = sprite.cob = 0;
   YglTexture texture;
@@ -5684,9 +5445,9 @@ void VIDOGLVdp1ScaledSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
   Vdp1ReadCommand(&cmd, Vdp1Regs->addr, Vdp1RamRender);
   /* A scaled sprite with CMDSIZE == 0 is not discarded but drawn as 1x1 (menu highlight in Vandal Hearts).
      Applies to ScaledSprite only, not to DistortedSprite. */
-  static int g0_an = -1;
-  if (g0_an < 0) { g0_an = 1; }   /* fixed on */
-  if (cmd.CMDSIZE == 0 && !g0_an) {
+  static int g0_on = -1;
+  if (g0_on < 0) { g0_on = 1; }   /* fixed on */
+  if (cmd.CMDSIZE == 0 && !g0_on) {
     return; // BAD Command
   }
 
@@ -5802,8 +5563,7 @@ void VIDOGLVdp1ScaledSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
   tmp <<= 16;
   tmp |= cmd.CMDPMOD;
 
-  // Texture cache persistence: source range of the sprite texture in VDP1 VRAM (conservatively the 16 bpp size,
-  // overlap is harmless); in LUT color mode the content also depends on the 32-byte color table at CMDCOLR<<3.
+  // texture source range for the cache, see VIDOGLVdp1NormalSpriteDraw
   {
     u32 s_w = ((cmd.CMDSIZE >> 8) & 0x3F) * 8;
     u32 s_h = cmd.CMDSIZE & 0xFF;
@@ -5857,7 +5617,7 @@ void VIDOGLVdp1ScaledSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
 
 
 
-  if ((CMDPMOD & 4) && !GouraudOhneWirkung(CMDPMOD))
+  if ((CMDPMOD & 4) && !GouraudNoEffect(CMDPMOD))
   {
     for (i = 0; i < 4; i++)
     {
@@ -5872,10 +5632,8 @@ void VIDOGLVdp1ScaledSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
     {
       if (1 == YglIsCached(_Ygl->texture_manager, tmp, &cash))
       {
-        // Opaque fast path: on a cache hit the flag from the previous decode of this exact texture is known
-        // (key tmp = CMDSRCA/CMDCOLR/CMDSIZE/CMDPMOD). Only pure REPLACE (no shadow/mesh/half-transparency/half-luminance)
-        // with no alpha-0 texel uses the discard-free SPD program; otherwise the normal path is used.
-        if (YglOpakFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE && cash.no_alpha0) {
+        // opaque fast path, see VIDOGLVdp1NormalSpriteDraw
+        if (YglOpaqueFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE && cash.no_alpha0) {
           sprite.blendmode = VDP1_COLOR_SPD;
         }
         if (cmd.CMDPMOD & 0x8000) _Ygl->msb_shadow_count_[_Ygl->drawframe]++;
@@ -5890,7 +5648,7 @@ void VIDOGLVdp1ScaledSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       {
         u8 p2_no_alpha0 = 0;
         Vdp1ReadTexture(&cmd, &sprite, &texture, &p2_no_alpha0);
-        cash.no_alpha0 = (YglOpakFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE) ? p2_no_alpha0 : 0;
+        cash.no_alpha0 = (YglOpaqueFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE) ? p2_no_alpha0 : 0;
         /* Switch to SPD on a cache miss as well, as soon as the flag is known: otherwise the same sprite would get a
            different shader program (and drawing order position) depending on the cache state, which shows as flicker
            on overlapping polygons. */
@@ -5911,7 +5669,7 @@ void VIDOGLVdp1ScaledSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       if (1 == YglIsCached(_Ygl->texture_manager, tmp, &cash))
       {
         // opaque fast path: see the Gouraud branch above
-        if (YglOpakFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE && cash.no_alpha0) {
+        if (YglOpaqueFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE && cash.no_alpha0) {
           sprite.blendmode = VDP1_COLOR_SPD;
         }
         if (cmd.CMDPMOD & 0x8000) _Ygl->msb_shadow_count_[_Ygl->drawframe]++;
@@ -5926,7 +5684,7 @@ void VIDOGLVdp1ScaledSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       {
         u8 p2_no_alpha0 = 0;
         Vdp1ReadTexture(&cmd, &sprite, &texture, &p2_no_alpha0);
-        cash.no_alpha0 = (YglOpakFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE) ? p2_no_alpha0 : 0;
+        cash.no_alpha0 = (YglOpaqueFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE) ? p2_no_alpha0 : 0;
         /* Switch to SPD on a cache miss as well, as soon as the flag is known: otherwise the same sprite would get a
            different shader program (and drawing order position) depending on the cache state, which shows as flicker
            on overlapping polygons. */
@@ -5947,29 +5705,29 @@ void VIDOGLVdp1ScaledSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
    isSquare branch). Vertex k is offset by a * (e[k-1] - e[k]) with e[k] the unit vector of edge k -> k+1; the
    perpendicular distance to both adjacent edges is then exactly a, independent of the aspect ratio.
    The offset a is given in Saturn pixels; it is currently 0 (disabled). */
-static float PolyNahtWert(void)
+static float PolySeamValue(void)
 {
   return 0.0f;
 }
 
 /* Minimum size: very small distorted quads (sparks, particles) would grow proportionally too much, so only
-   quads with at least NAHT_MINKANTE pixels perimeter are treated. */
-#define NAHT_MINKANTE 24.0f
+   quads with at least SEAM_MINEDGE pixels perimeter are treated. */
+#define SEAM_MINEDGE 24.0f
 
-static void PolyNahtOutset(float * v)
+static void PolySeamOutset(float * v)
 {
-  const float a = PolyNahtWert();
+  const float a = PolySeamValue();
   float ex[4], ey[4], ox[4], oy[4];
-  float umfang = 0.0f;
+  float extent = 0.0f;
   int k;
   if (a <= 0.0f) return;
   for (k = 0; k < 4; k++) {
     const int n = (k + 1) & 3;
     const float dx = v[(n << 1) + 0] - v[(k << 1) + 0];
     const float dy = v[(n << 1) + 1] - v[(k << 1) + 1];
-    umfang += fabsf(dx) + fabsf(dy);
+    extent += fabsf(dx) + fabsf(dy);
   }
-  if (umfang < NAHT_MINKANTE) return;
+  if (extent < SEAM_MINEDGE) return;
   for (k = 0; k < 4; k++) {
     const int n = (k + 1) & 3;
     const float dx = v[(n << 1) + 0] - v[(k << 1) + 0];
@@ -5992,12 +5750,51 @@ static void PolyNahtOutset(float * v)
 }
 
 
+/* The Saturn rasterizes a quad as a stack of lines along AD/BC, so it is always at least one pixel wide
+   (Mednafen vdp1_sprite.cpp, Ymir QuadStepper). The GL path draws two triangles; a band thinner than one pixel
+   hardly hits any pixel centers and vanishes piecewise (Tennis Arena court lines). Widen such bands across their
+   centre line to one Saturn pixel; the corner order (texture mapping) is kept.
+   Returns 1 for a band along AB (A~D, B~C), 2 for a band along AD (A~B, D~C), 0 otherwise. Ends may be up to
+   2 px wide, but only for a long band (length >= 8 px). */
+static int ThinQuadBand(const float *v)
+{
+  const float t = 2.0f;
+  if (fabsf(v[0] - v[6]) <= t && fabsf(v[1] - v[7]) <= t && fabsf(v[2] - v[4]) <= t && fabsf(v[3] - v[5]) <= t &&
+      fabsf(v[0] + v[6] - v[2] - v[4]) + fabsf(v[1] + v[7] - v[3] - v[5]) >= 16.0f) return 1;
+  if (fabsf(v[0] - v[2]) <= t && fabsf(v[1] - v[3]) <= t && fabsf(v[6] - v[4]) <= t && fabsf(v[7] - v[5]) <= t &&
+      fabsf(v[0] + v[2] - v[6] - v[4]) + fabsf(v[1] + v[3] - v[7] - v[5]) >= 16.0f) return 2;
+  return 0;
+}
+
+static void ThinQuadWiden(float *v)
+{
+  float *e0, *e1, *f0, *f1;   /* band runs from the (e0|f0) midpoint to the (e1|f1) midpoint */
+  switch (ThinQuadBand(v)) {
+    case 1: e0 = v + 0; e1 = v + 2; f0 = v + 6; f1 = v + 4; break;
+    case 2: e0 = v + 0; e1 = v + 6; f0 = v + 2; f1 = v + 4; break;
+    default: return;
+  }
+  {
+    const float m0x = (e0[0] + f0[0]) * 0.5f, m0y = (e0[1] + f0[1]) * 0.5f;
+    const float m1x = (e1[0] + f1[0]) * 0.5f, m1y = (e1[1] + f1[1]) * 0.5f;
+    float nx = -(m1y - m0y), ny = m1x - m0x, len = sqrtf(nx * nx + ny * ny);
+    if (len <= EPSILON) { nx = 0.0f; ny = 1.0f; } else { nx /= len; ny /= len; }
+    /* keep the opposite edge on its side */
+    if ((f0[0] + f1[0] - e0[0] - e1[0]) * nx + (f0[1] + f1[1] - e0[1] - e1[1]) * ny < 0.0f) { nx = -nx; ny = -ny; }
+    {
+      /* only raise the width across the band to one pixel at each end; wider ends stay untouched */
+      const float p0 = (f0[0] - e0[0]) * nx + (f0[1] - e0[1]) * ny, p1 = (f1[0] - e1[0]) * nx + (f1[1] - e1[1]) * ny;
+      if (p0 < 1.0f) { const float h = 0.5f * (1.0f - p0); e0[0] -= h * nx; e0[1] -= h * ny; f0[0] += h * nx; f0[1] += h * ny; }
+      if (p1 < 1.0f) { const float h = 0.5f * (1.0f - p1); e1[0] -= h * nx; e1[1] -= h * ny; f1[0] += h * nx; f1[1] += h * ny; }
+    }
+  }
+}
+
 void VIDOGLVdp1DistortedSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
 {
   vdp1cmd_struct cmd;
   YglSprite sprite;
-  /* id/cor/cog/cob must be initialised: they enter the batching decision as comparison values, and uninitialised
-     stack made almost every sprite force its own draw call. id is additionally set to the texture hash below where available. */
+  /* id/cor/cog/cob: see VIDOGLVdp1NormalSpriteDraw */
   sprite.id = 0;   /* final value is set right before the draw call, see BatchId() */
   sprite.cor = sprite.cog = sprite.cob = 0;
   YglTexture texture;
@@ -6148,11 +5945,12 @@ void VIDOGLVdp1DistortedSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
   }
 #endif
 #endif
+  if (!isSquare) ThinQuadWiden(sprite.vertices);
 
 
   /* Distorted quads only: axis-parallel ones are compensated in the isSquare branch, 2D sprites and text use
   other drawing paths. */
-  if (!isSquare) PolyNahtOutset(sprite.vertices);
+  if (!isSquare) PolySeamOutset(sprite.vertices);
 
   sprite.vertices[0] = (sprite.vertices[0] + Vdp1Regs->localX) * vdp1wratio;
   sprite.vertices[1] = (sprite.vertices[1] + Vdp1Regs->localY) * vdp1hratio;
@@ -6172,8 +5970,7 @@ void VIDOGLVdp1DistortedSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
   tmp <<= 16;
   tmp |= cmd.CMDPMOD;
 
-  // Texture cache persistence: source range of the sprite texture in VDP1 VRAM (conservatively the 16 bpp size,
-  // overlap is harmless); in LUT color mode the content also depends on the 32-byte color table at CMDCOLR<<3.
+  // texture source range for the cache, see VIDOGLVdp1NormalSpriteDraw
   {
     u32 s_w = ((cmd.CMDSIZE >> 8) & 0x3F) * 8;
     u32 s_h = cmd.CMDSIZE & 0xFF;
@@ -6221,7 +6018,7 @@ void VIDOGLVdp1DistortedSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
 
 
   // Check if the Gouraud shading bit is set and the color mode is RGB
-  if ((cmd.CMDPMOD & 4) && !GouraudOhneWirkung(cmd.CMDPMOD))
+  if ((cmd.CMDPMOD & 4) && !GouraudNoEffect(cmd.CMDPMOD))
   {
     for (i = 0; i < 4; i++)
     {
@@ -6234,10 +6031,8 @@ void VIDOGLVdp1DistortedSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
 
       if (1 == YglIsCached(_Ygl->texture_manager, tmp, &cash))
       {
-        // Opaque fast path: on a cache hit the flag from the previous decode of this exact texture is known
-        // (key tmp = CMDSRCA/CMDCOLR/CMDSIZE/CMDPMOD). Only pure REPLACE (no shadow/mesh/half-transparency/half-luminance)
-        // with no alpha-0 texel uses the discard-free SPD program; otherwise the normal path is used.
-        if (YglOpakFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE && cash.no_alpha0) {
+        // opaque fast path, see VIDOGLVdp1NormalSpriteDraw
+        if (YglOpaqueFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE && cash.no_alpha0) {
           sprite.blendmode = VDP1_COLOR_SPD;
         }
         if (cmd.CMDPMOD & 0x8000) _Ygl->msb_shadow_count_[_Ygl->drawframe]++;
@@ -6252,7 +6047,7 @@ void VIDOGLVdp1DistortedSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       {
         u8 p2_no_alpha0 = 0;
         Vdp1ReadTexture(&cmd, &sprite, &texture, &p2_no_alpha0);
-        cash.no_alpha0 = (YglOpakFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE) ? p2_no_alpha0 : 0;
+        cash.no_alpha0 = (YglOpaqueFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE) ? p2_no_alpha0 : 0;
         /* Switch to SPD on a cache miss as well, as soon as the flag is known: otherwise the same sprite would get a
            different shader program (and drawing order position) depending on the cache state, which shows as flicker
            on overlapping polygons. */
@@ -6266,7 +6061,7 @@ void VIDOGLVdp1DistortedSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       if (1 == YglIsCached(_Ygl->texture_manager, tmp, &cash))
       {
         // opaque fast path: see the Gouraud branch above
-        if (YglOpakFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE && cash.no_alpha0) {
+        if (YglOpaqueFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE && cash.no_alpha0) {
           sprite.blendmode = VDP1_COLOR_SPD;
         }
         if (cmd.CMDPMOD & 0x8000) _Ygl->msb_shadow_count_[_Ygl->drawframe]++;
@@ -6281,7 +6076,7 @@ void VIDOGLVdp1DistortedSpriteDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       {
         u8 p2_no_alpha0 = 0;
         Vdp1ReadTexture(&cmd, &sprite, &texture, &p2_no_alpha0);
-        cash.no_alpha0 = (YglOpakFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE) ? p2_no_alpha0 : 0;
+        cash.no_alpha0 = (YglOpaqueFastEnabled() && sprite.blendmode == VDP1_COLOR_CL_REPLACE) ? p2_no_alpha0 : 0;
         /* Switch to SPD on a cache miss as well, as soon as the flag is known: otherwise the same sprite would get a
            different shader program (and drawing order position) depending on the cache state, which shows as flicker
            on overlapping polygons. */
@@ -6302,8 +6097,7 @@ void VIDOGLVdp1PolygonDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
   u16 CMDPMOD;
   u8 alpha;
   YglSprite sprite;
-  /* id/cor/cog/cob must be initialised: they enter the batching decision as comparison values, and uninitialised
-     stack made almost every sprite force its own draw call. id is additionally set to the texture hash below where available. */
+  /* id/cor/cog/cob: see VIDOGLVdp1NormalSpriteDraw */
   sprite.id = 0;   /* final value is set right before the draw call, see BatchId() */
   sprite.cor = sprite.cog = sprite.cob = 0;
   YglTexture texture;
@@ -6368,6 +6162,9 @@ void VIDOGLVdp1PolygonDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
   if (sprite.vertices[2] - sprite.vertices[0] > 350) {
     isSquare = 1;
   }
+  /* A quad collapsed to a line (A=B, C=D) has zero-length edges and passes the rectangle test above; the
+     rectangle branch would only shift single corners (half triangle). Let ThinQuadWiden handle it instead. */
+  if (isSquare && ThinQuadBand(sprite.vertices)) isSquare = 0;
 
   if (isSquare) {
     // find upper left opsition
@@ -6420,6 +6217,7 @@ void VIDOGLVdp1PolygonDraw(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       sprite.vertices[(((lt_index + 3) & 0x03) << 1) + 1] += 0;
     }
   }
+  if (!isSquare) ThinQuadWiden(sprite.vertices);
 
 #ifdef PERFRAME_LOG
   if (ppfp != NULL) {
@@ -7138,7 +6936,7 @@ int VIDOGLVdp2Reset(void)
 
 void VIDOGLVdp2DrawStart(void)
 {
-  g_einweg_bild++;
+  g_oneway_frame++;
   fixVdp2Regs = Vdp2RestoreRegs(0, Vdp2LinesRender);
   if (fixVdp2Regs == NULL) fixVdp2Regs = Vdp2Regs;
   VIDOGLVdp2SetResolution(fixVdp2Regs->TVMD);
@@ -7165,48 +6963,44 @@ void VIDOGLVdp2DrawStart(void)
   // full, resize) or when the shelf allocator (without free list) has largely filled the atlas -- then a single
   // generation flush is done instead of unbounded realloc growth. flg=1 on pull keeps the PBO content (no INVALIDATE).
   if (g_texcache_persist) {
-    /* Flush threshold is half the atlas height: texture coordinates are absolute in the vertex buffer and are divided
-       by the CURRENT atlas height in the shader (u_texsize). If yMax overflowed within one frame, YglTMRealloc would
-       recreate texture and PBO and already queued quads would sample at the wrong position. With 1/2 a half atlas
-       of headroom remains, so a realloc within a frame is unreachable. */
-    if (AtlasAdaptAn()) {
-      static unsigned s_atl_bild = 0;
+    /* Flush early enough that the atlas never has to grow inside a frame: texture coordinates in queued quads are
+       divided by the CURRENT atlas height in the shader (u_texsize), so a realloc within a frame would let them
+       sample at the wrong position. Reserve: the decaying peak growth per frame plus 256 rows. */
+    {
+      static unsigned s_atl_frame = 0;
       const int ym = YglTM->yMax;
-      s_atl_bild++;
-      if (g_atl_ymax_vor >= 0 && !g_atl_frisch && ym >= g_atl_ymax_vor) {
-        const int dz = ym - g_atl_ymax_vor;
-        g_atl_wachs = (dz > g_atl_wachs) ? dz : (g_atl_wachs - (g_atl_wachs >> 6));
+      s_atl_frame++;
+      if (g_atl_ymax_prev >= 0 && !g_atl_fresh && ym >= g_atl_ymax_prev) {
+        const int dz = ym - g_atl_ymax_prev;
+        g_atl_grow = (dz > g_atl_grow) ? dz : (g_atl_grow - (g_atl_grow >> 6));
       }
-      g_atl_frisch = 0;
-      g_atl_ymax_vor = ym;
-      if ((int)YglTM->height - ym < g_atl_wachs + (g_atl_wachs >> 1) + AtlasAdaptMin()) {
+      g_atl_fresh = 0;
+      g_atl_ymax_prev = ym;
+      if ((int)YglTM->height - ym < g_atl_grow + (g_atl_grow >> 1) + 256) {
         /* Let the peak decay while flushing too, otherwise it sustains itself:
            flush -> next frame fresh -> not measured -> growth never shrinks -> flush every frame. */
-        g_atl_wachs -= g_atl_wachs >> 2;
+        g_atl_grow -= g_atl_grow >> 2;
         YglTMRequestFlush();
         /* If flushes keep coming within a few frames, the working set does not fit: grow the atlas here, at frame
            start, where no queued quad refers to the old buffer yet. Without this the atlas can only grow by an
            overflow inside a frame, which the early flush above prevents, and the game stays at half speed. */
         {
-          static unsigned s_letzt = 0, s_folge = 0;
-          s_folge = (s_atl_bild - s_letzt <= 3) ? s_folge + 1 : 0;
-          s_letzt = s_atl_bild;
-          if (s_folge >= 4 && YglTM->height < 4096) {
+          static unsigned s_last = 0, s_seq = 0;
+          s_seq = (s_atl_frame - s_last <= 3) ? s_seq + 1 : 0;
+          s_last = s_atl_frame;
+          if (s_seq >= 4 && YglTM->height < 4096) {
             unsigned int nh = YglTM->height + 1024;
             if (nh > 4096) nh = 4096;
             YglTMRealloc(YglTM, YglTM->width, nh);
-            s_folge = 0;
+            s_seq = 0;
           }
         }
       }
-    } else
-    if (YglTM->yMax > (int)(AtlasHalbAn() ? (YglTM->height / 2)
-                                          : ((YglTM->height / 4) * 3)))
-      YglTMRequestFlush();
+    }
     YglTmPull(YglTM, 1);
     if (YglTMFlushRequested()) {
       extern void YglTMClearFlushRequest_(void);
-      g_atl_frisch = 1; g_atl_ymax_vor = 0;   /* next frame is a fresh allocation */
+      g_atl_fresh = 1; g_atl_ymax_prev = 0;   /* next frame is a fresh allocation */
       YglTMReset(YglTM);
       YglCacheReset(YglTM);
       YglTMClearFlushRequest_();
@@ -7583,23 +7377,14 @@ INLINE int Vdp2CheckCharAccessPenalty(int char_access, int ptn_access) {
 
 
 /* Fixed atlas slot per call site (see YglQuadSlot in ygles.c). If the site is needed a second time within the same
-   frame it falls back to the normal path, otherwise the second call would overwrite the content of the first.
-   g_einweg_an == 2 uses two slots per site, alternating by frame parity. */
-static int g_einweg_an = -1;
-static int EinwegSlotAn(void) {
-  if (g_einweg_an < 0) {
-    g_einweg_an = 1;   /* fixed: fixed atlas slot */
-  }
-  return g_einweg_an;
-}
-static void EinwegQuad(vdp2draw_struct *it, YglTexture *tex, YglCache *c, int stelle) {
-  if (!EinwegSlotAn() || stelle < 0 || stelle >= 16 || g_einweg_zuletzt[stelle] == g_einweg_bild) {
+   frame it falls back to the normal path, otherwise the second call would overwrite the content of the first. */
+static void OnewayQuad(vdp2draw_struct *it, YglTexture *tex, YglCache *c, int pos_val) {
+  if (pos_val < 0 || pos_val >= 16 || g_oneway_last[pos_val] == g_oneway_frame) {
     YglQuad(it, tex, c);
     return;
   }
-  g_einweg_zuletzt[stelle] = g_einweg_bild;
-  YglQuadSlot(it, tex, c, 0xC0000000CADull ^ ((u64)(stelle + 1) << 44)
-                          ^ (g_einweg_an == 2 ? ((u64)(g_einweg_bild & 1) << 40) : 0));
+  g_oneway_last[pos_val] = g_oneway_frame;
+  YglQuadSlot(it, tex, c, 0xC0000000CADull ^ ((u64)(pos_val + 1) << 44));
 }
 
 static void Vdp2DrawNBG0(void)
@@ -7910,8 +7695,8 @@ static void Vdp2DrawNBG0(void)
         else
           infotmp.cellh = vdp2height;
         texture.textdata = 0;
-        EinwegQuad(&infotmp, &texture, &tmpc, 1);
-        RandScrollTor(0, 0);   /* zoom/line scroll path not covered, only counted */
+        OnewayQuad(&infotmp, &texture, &tmpc, 1);
+        EdgeScrollGate(0, 0);   /* zoom/line scroll path: not covered */
         if( texture.textdata != 0 ){
             Vdp2DrawBitmapCoordinateInc(&info, &texture);
         }
@@ -7938,13 +7723,13 @@ static void Vdp2DrawNBG0(void)
           vdp2draw_struct infotmp = info;
           infotmp.cellw = vdp2width;
           infotmp.cellh = vdp2height;
-          EinwegQuad(&infotmp, &texture, &tmpc, 2);
-          RandScrollTor(0, 0);   /* zoom/line scroll path not covered, only counted */
+          OnewayQuad(&infotmp, &texture, &tmpc, 2);
+          EdgeScrollGate(0, 0);   /* zoom/line scroll path: not covered */
           Vdp2DrawBitmapLineScroll(&info, &texture);
 
         }
         else {
-          const int rs_ = RandScrollTor(0, info.mosaicxmask == 1);   /* bitmap without zoom/line scroll */
+          const int rs_ = EdgeScrollGate(0, info.mosaicxmask == 1);   /* bitmap without zoom/line scroll */
           yy = info.y;
           while (yy + info.y < vdp2height)
           {
@@ -7986,8 +7771,8 @@ static void Vdp2DrawNBG0(void)
     {
       /* If the line scroll is only an identity ramp, the cheap tile path computes the same result: redirect there. */
       int pli_h0 = 0, pli_v0 = 0;
-      int pli_um = (PerLineIdentAn() && info.islinescroll
-                    && PerLineIstIdentitaet(&info, vdp2height, &pli_h0, &pli_v0));
+      int pli_um = (info.islinescroll
+                    && PerLineIsIdentity(&info, vdp2height, &pli_h0, &pli_v0));
       if (info.islinescroll && !pli_um) {
         info.sh = (fixVdp2Regs->SCXIN0 & 0x7FF);
         info.sv = (fixVdp2Regs->SCYIN0 & 0x7FF);
@@ -8003,11 +7788,11 @@ static void Vdp2DrawNBG0(void)
         info.vertices[7] = vdp2height;
         vdp2draw_struct infotmp = info;
         infotmp.cellw = vdp2width;
-        infotmp.cellh = (InterHalbAn() && vdp2height >= 448) ? (vdp2height >> 1) : vdp2height;
+        infotmp.cellh = (InterlaceHalfActive() && vdp2height >= 448) ? (vdp2height >> 1) : vdp2height;
 
         infotmp.flipfunction = 0;
-        EinwegQuad(&infotmp, &texture, &tmpc, 3);
-        RandScrollTor(0, 0);   /* zoom/line scroll path not covered, only counted */
+        OnewayQuad(&infotmp, &texture, &tmpc, 3);
+        EdgeScrollGate(0, 0);   /* zoom/line scroll path: not covered */
         Vdp2DrawMapPerLine(&info, &texture);
       }
       else {
@@ -8015,9 +7800,9 @@ static void Vdp2DrawNBG0(void)
            here it belongs to x/y. It is always carried along, otherwise the result would only be correct by chance. */
         info.x = (fixVdp2Regs->SCXIN0 & 0x7FF) + pli_h0;
         info.y = (fixVdp2Regs->SCYIN0 & 0x7FF) + pli_v0;
-        g_rs_akt = RandScrollTor(0, info.coordincx == 1.0f && pli_h0 == 0 && info.mosaicxmask == 1);
+        g_es_active = EdgeScrollGate(0, info.coordincx == 1.0f && pli_h0 == 0 && info.mosaicxmask == 1);
         Vdp2DrawMapTest(&info, &texture);
-        g_rs_akt = 0;
+        g_es_active = 0;
       }
     }
   }
@@ -8235,8 +8020,8 @@ static void Vdp2DrawNBG1(void)
       else
         infotmp.cellh = vdp2height;
 
-      EinwegQuad(&infotmp, &texture, &tmpc, 4);
-      RandScrollTor(1, 0);   /* zoom/line scroll path not covered, only counted */
+      OnewayQuad(&infotmp, &texture, &tmpc, 4);
+      EdgeScrollGate(1, 0);   /* zoom/line scroll path: not covered */
       Vdp2DrawBitmapCoordinateInc(&info, &texture);
     }
     else {
@@ -8261,13 +8046,13 @@ static void Vdp2DrawNBG1(void)
         vdp2draw_struct infotmp = info;
         infotmp.cellw = vdp2width;
         infotmp.cellh = vdp2height;
-        EinwegQuad(&infotmp, &texture, &tmpc, 5);
-        RandScrollTor(1, 0);   /* zoom/line scroll path not covered, only counted */
+        OnewayQuad(&infotmp, &texture, &tmpc, 5);
+        EdgeScrollGate(1, 0);   /* zoom/line scroll path: not covered */
         Vdp2DrawBitmapLineScroll(&info, &texture);
 
       }
       else {
-        const int rs_ = RandScrollTor(1, info.mosaicxmask == 1);   /* bitmap without zoom/line scroll */
+        const int rs_ = EdgeScrollGate(1, info.mosaicxmask == 1);   /* bitmap without zoom/line scroll */
         yy = info.y;
         while (yy + info.y < vdp2height)
         {
@@ -8308,8 +8093,8 @@ static void Vdp2DrawNBG1(void)
   else {
     /* identity ramp: use the tile path (see NBG0) */
     int pli_h0 = 0, pli_v0 = 0;
-    int pli_um = (PerLineIdentAn() && info.islinescroll
-                  && PerLineIstIdentitaet(&info, vdp2height, &pli_h0, &pli_v0));
+    int pli_um = (info.islinescroll
+                  && PerLineIsIdentity(&info, vdp2height, &pli_h0, &pli_v0));
     if (info.islinescroll && !pli_um) {
       info.sh = (fixVdp2Regs->SCXIN1 & 0x7FF);
       info.sv = (fixVdp2Regs->SCYIN1 & 0x7FF);
@@ -8325,10 +8110,10 @@ static void Vdp2DrawNBG1(void)
       info.vertices[7] = vdp2height;
       vdp2draw_struct infotmp = info;
       infotmp.cellw = vdp2width;
-      infotmp.cellh = (InterHalbAn() && vdp2height >= 448) ? (vdp2height >> 1) : vdp2height;
+      infotmp.cellh = (InterlaceHalfActive() && vdp2height >= 448) ? (vdp2height >> 1) : vdp2height;
       infotmp.flipfunction = 0;
-      EinwegQuad(&infotmp, &texture, &tmpc, 6);
-      RandScrollTor(1, 0);   /* zoom/line scroll path not covered, only counted */
+      OnewayQuad(&infotmp, &texture, &tmpc, 6);
+      EdgeScrollGate(1, 0);   /* zoom/line scroll path: not covered */
       Vdp2DrawMapPerLine(&info, &texture);
     }
     else {
@@ -8336,9 +8121,9 @@ static void Vdp2DrawNBG1(void)
       /* constant offset of the ramp, see NBG0 */
       info.x = (fixVdp2Regs->SCXIN1 & 0x7FF) + pli_h0;
       info.y = (fixVdp2Regs->SCYIN1 & 0x7FF) + pli_v0;
-      g_rs_akt = RandScrollTor(1, info.coordincx == 1.0f && pli_h0 == 0 && info.mosaicxmask == 1);
+      g_es_active = EdgeScrollGate(1, info.coordincx == 1.0f && pli_h0 == 0 && info.mosaicxmask == 1);
       Vdp2DrawMapTest(&info, &texture);
-      g_rs_akt = 0;
+      g_es_active = 0;
     }
   }
 
@@ -8498,15 +8283,15 @@ static void Vdp2DrawNBG2(void)
     infotmp.cellw = vdp2width;
     infotmp.cellh = vdp2height;
     infotmp.flipfunction = 0;
-    EinwegQuad(&infotmp, &texture, &tmpc, 7);
-    RandScrollTor(2, 0);   /* zoom/line scroll path not covered, only counted */
+    OnewayQuad(&infotmp, &texture, &tmpc, 7);
+    EdgeScrollGate(2, 0);   /* zoom/line scroll path: not covered */
     Vdp2DrawMapPerLineNbg23(&info, &texture,2,xoffset);
   } else {
     info.x = (fixVdp2Regs->SCXN2 & 0x7FF) + xoffset;
     info.y = fixVdp2Regs->SCYN2 & 0x7FF;
-    g_rs_akt = RandScrollTor(2, info.coordincx == 1.0f && xoffset == 0 && info.mosaicxmask == 1);
+    g_es_active = EdgeScrollGate(2, info.coordincx == 1.0f && xoffset == 0 && info.mosaicxmask == 1);
     Vdp2DrawMapTest(&info, &texture);
-    g_rs_akt = 0;
+    g_es_active = 0;
   }
 
 }
@@ -8663,15 +8448,15 @@ static void Vdp2DrawNBG3(void)
     infotmp.cellw = vdp2width;
     infotmp.cellh = vdp2height;
     infotmp.flipfunction = 0;
-    EinwegQuad(&infotmp, &texture, &tmpc, 8);
-    RandScrollTor(3, 0);   /* zoom/line scroll path not covered, only counted */
+    OnewayQuad(&infotmp, &texture, &tmpc, 8);
+    EdgeScrollGate(3, 0);   /* zoom/line scroll path: not covered */
     Vdp2DrawMapPerLineNbg23(&info, &texture,3,xoffset);
   } else {
     info.x = (fixVdp2Regs->SCXN3 & 0x7FF) + xoffset;
     info.y = fixVdp2Regs->SCYN3 & 0x7FF;
-    g_rs_akt = RandScrollTor(3, info.coordincx == 1.0f && xoffset == 0 && info.mosaicxmask == 1);
+    g_es_active = EdgeScrollGate(3, info.coordincx == 1.0f && xoffset == 0 && info.mosaicxmask == 1);
     Vdp2DrawMapTest(&info, &texture);
-    g_rs_akt = 0;
+    g_es_active = 0;
   }
 
 }
@@ -8696,7 +8481,7 @@ static void Vdp2DrawRBG0(void)
   info->priority = fixVdp2Regs->PRIR & 0x7;
   if (!(info->enable & Vdp2External.disptoggle) || (info->priority == 0)) {
 
-    if ((Vdp1RenderRegsGueltig ? Vdp1RenderTVMR : Vdp1Regs->TVMR) & 0x02) {
+    if ((Vdp1RenderRegsValid ? Vdp1RenderTVMR : Vdp1Regs->TVMR) & 0x02) {
       Vdp2ReadRotationTable(0, &paraA, fixVdp2Regs, Vdp2RamRender);
     }
     return;
@@ -9037,11 +8822,11 @@ static void Vdp2DrawRBG0(void)
 
 //////////////////////////////////////////////////////////////////////////////
 /* Vdp2DrawScreens split into parts (Vor / Nbg / RotationSync) that run serially; bit-identical to the whole. */
-static void Vdp2DrawScreensVor(int zugriffsmaske)
+static void Vdp2DrawScreensPre(int access_mask)
 {
   fixVdp2Regs = Vdp2RestoreRegs(0, Vdp2LinesRender);
   if (fixVdp2Regs == NULL) fixVdp2Regs = Vdp2Regs;
-  if (zugriffsmaske) Vdp2GetAccessPattern(fixVdp2Regs, oglAcVram);   /* otherwise Vdp1DrawStart sets it */
+  if (access_mask) Vdp2GetAccessPattern(fixVdp2Regs, oglAcVram);   /* otherwise Vdp1DrawStart sets it */
   memcpy(&baseVdp2Regs, fixVdp2Regs, sizeof(Vdp2));
   fixVdp2Regs = &baseVdp2Regs;
 
@@ -9050,34 +8835,34 @@ static void Vdp2DrawScreensVor(int zugriffsmaske)
   Vdp2GenerateWindowInfo();
 
 
-  if (!NbgAus(4)) Vdp2DrawRBG0();
+  Vdp2DrawRBG0();
   FrameProfileAdd("RBG0 end");
 
   Vdp2DrawBackScreen();
   Vdp2DrawLineColorScreen();
 }
 
-static void Vdp2DrawScreensNbg(int mit_nbg0)
+static void Vdp2DrawScreensNbg(int with_nbg0)
 {
-  RandScrollBild();   /* g_rs_n[] per frame from fixVdp2Regs */
-  if (!NbgAus(3)) Vdp2DrawNBG3();
+  EdgeScrollFrame();   /* g_rs_n[] per frame from fixVdp2Regs */
+  Vdp2DrawNBG3();
   FrameProfileAdd("NBG3 end");
-  if (!NbgAus(2)) Vdp2DrawNBG2();
+  Vdp2DrawNBG2();
   FrameProfileAdd("NBG2 end");
-  if (!NbgAus(1)) Vdp2DrawNBG1();
+  Vdp2DrawNBG1();
   FrameProfileAdd("NBG1 end");
-  if (mit_nbg0) {
-    if (!NbgAus(0)) Vdp2DrawNBG0();
+  if (with_nbg0) {
+    Vdp2DrawNBG0();
     FrameProfileAdd("NBG0 end");
   }
 }
 
 void VIDOGLVdp2DrawScreens(void)
 {
-  /* In the serial path Vdp2DrawScreensVor(0) does not recompute the VRAM access mask oglAcVram; only
+  /* In the serial path Vdp2DrawScreensPre(0) does not recompute the VRAM access mask oglAcVram; only
        VIDOGLVdp1DrawStart does, and only if VDP1 draws in that frame. A pure VDP2 bitmap player (FMV) with double
        buffering switches the bank accesses; with a stale mask the displayed bank counts as invalid and
-       BankUngueltig() fills whole bitmap lines with 0 (black frame every second time). Fix: compute the mask
+       BankInvalid() fills whole bitmap lines with 0 (black frame every second time). Fix: compute the mask
        every frame from the same register snapshot. */
   {
     static int acjb = -1;
@@ -9085,9 +8870,9 @@ void VIDOGLVdp2DrawScreens(void)
       acjb = 1;   /* fixed on */
     }
     if (acjb) {
-      Vdp2DrawScreensVor(1);
+      Vdp2DrawScreensPre(1);
     } else {
-      Vdp2DrawScreensVor(0);
+      Vdp2DrawScreensPre(0);
     }
   }
   Vdp2DrawScreensNbg(1);

@@ -19,7 +19,6 @@
 /* ---- slow path: exactly one iteration, stage A (macros DA_) ----
    Entered only if T0 != 0 or dsp_dma_wait > 0 at the iteration head. step_dsp_dma runs at the same places as in
    ScuDspExecInner (head, readgensrc, writed1busdest, writeloadimdest, DMA, END). */
-static int dv_enddma_an(void) { return 1; }   /* finish open DMA at END (as Kronos and Yabause 1.20.37) */
 #ifdef WORDS_BIGENDIAN
 #define DA_SH(k) ((3u - (u32)(k)) * 8u)
 #else
@@ -239,11 +238,11 @@ static s32 __attribute__((noinline, cold)) dv_langsam(scudspregs_struct *const D
                break;
             case 0x0E: // LPS / BTM
                if (lop != 0) { jmp = (instruction & 0x8000000) ? (s32)pc : (s32)top; dly = 0; lop--; }
+               else if (!(instruction & 0x8000000)) lop = (lop - 1) & 0xFFF;   /* BTM always decrements LOP (same as ScuDspExecInner) */
                break;
             case 0x0F: // END
-               {  /* identical to the fast path */
-                  const int an = dv_enddma_an();
-                  if (an && dw > 0) {
+               {  /* finish an open DMA at END, as in the fast path (and Kronos, Yabause 1.20.37) */
+                  if (dw > 0) {
                      dw = 0;
                      DA_STEP();
                   }
@@ -315,7 +314,7 @@ typedef struct { u64 a, b; } dv_ent;
 enum { DV_K_MVI = 16, DV_K_DMA, DV_K_JMP, DV_K_LPS, DV_K_BTM, DV_K_END, DV_K_NIX };
 enum { DV_D1_NIX = 0, DV_D1_IMM_MD, DV_D1_IMM_REG, DV_D1_MD_MD, DV_D1_MD_REG, DV_D1_SP_MD, DV_D1_SP_REG };
 static dv_ent s_vor[256];                       /* zero-initialised = decode(0) */
-static unsigned long long s_dv_dek = 0, s_dv_lang = 0;   /* statistics: re-decodes, slow iterations */
+static int s_vorh[256], s_vord[256];   /* label offsets per slot; 0/0 = k_nop/d_nix = effect of decode(0) */
 
 static inline u32 dv_flagmaske(int z, int s, int c, int t0) {
    __typeof__(ScuDsp->ProgControlPort) u; u.all = 0;
@@ -330,7 +329,7 @@ static void dv_bedingung(u32 *m, u32 *pol, u32 code) {
       *pol = (code & 0x20) ? 1 : 0;
    } else { *m = 0; *pol = 1; }                  /* never */
 }
-static void __attribute__((noinline, cold)) dv_dekodiere(dv_ent *ziel, u32 raw) {
+static void __attribute__((noinline, cold)) dv_dekodiere(dv_ent *goal, u32 raw) {
    u32 imm = 0, m = 0, kind = 0, ops = 0, aop = 0, d1c = 0, sh1 = 0, sh2 = 0, dfeld = 0;
    switch (raw >> 30) {
    case 0: {
@@ -386,15 +385,12 @@ static void __attribute__((noinline, cold)) dv_dekodiere(dv_ent *ziel, u32 raw) 
       break;
    default: kind = DV_K_NIX; break;             /* class 1: invalid, does nothing */
    }
-   ziel->a = (u64)raw | ((u64)imm << 32);
-   ziel->b = (u64)m | ((u64)kind << 32) | ((u64)ops << 40) | ((u64)aop << 44) | ((u64)d1c << 46)
+   goal->a = (u64)raw | ((u64)imm << 32);
+   goal->b = (u64)m | ((u64)kind << 32) | ((u64)ops << 40) | ((u64)aop << 44) | ((u64)d1c << 46)
            | ((u64)sh1 << 49) | ((u64)sh2 << 54) | ((u64)dfeld << 59);
-   s_dv_dek++;
 }
 
-static unsigned long long s_dv_bef = 0, s_dv_auf = 0;
-static time_t s_dv_t = 0;
-static void __attribute__((noinline)) ScuDspExecVor(u32 timing) {
+static void __attribute__((noinline)) ScuDspExecPrecompiled(u32 timing) {
    scudspregs_struct *const DL = ScuDsp;
    u32 *const mdb = &DL->MD[0][0];
    u32 pc, ctp; s32 jmp, rx, ry;
@@ -414,28 +410,42 @@ static void __attribute__((noinline)) ScuDspExecVor(u32 timing) {
       &&d_nix - &&d_nix, &&d_imm_md - &&d_nix, &&d_imm_reg - &&d_nix, &&d_md_md - &&d_nix, &&d_md_reg - &&d_nix,
       &&d_sp_md - &&d_nix, &&d_sp_reg - &&d_nix, &&d_nix - &&d_nix };
    s32 dsp_counter = (s32)timing;
+   int pruef = 1;   /* check T0/dsp_dma_wait only where they can change */
+   u32 inc = 0, v = 0;
+   u64 ea = 0, eb = 0;
+/* fetch the next instruction and jump straight into its handler (replicated at every instruction end) */
+#define DV_NEXT() do { ea = s_vor[pc].a; eb = s_vor[pc].b; \
+      if (__builtin_expect((u32)ea != DL->ProgramRam[pc], 0)) goto new_val; \
+      alu.all = ac.all; goto *(&&k_nop + s_vorh[pc]); } while (0)
+#define DV_TAIL0() do { pc = (pc + 1u) & 0xFFu;                   /* u8 wrap-around */ \
+      if (__builtin_expect(jmp != (s32)0xFFFFFFFF, 0)) {            /* MVI -1 to PC leaves jmpaddr = 0xFFFFFFFF */ \
+         if (DL->delayed) { pc = (u8)jmp; jmp = (s32)0xFFFFFFFF; dsp_counter += 1; } \
+         else DL->delayed = 1; } \
+      if (--dsp_counter <= 0) goto aus; \
+      if (__builtin_expect(pruef, 0)) goto head_val; \
+      DV_NEXT(); } while (0)
+#define DV_TAIL_INC() do { if (inc) DV_CTINC(inc); DV_TAIL0(); } while (0)
    DV_LOAD();
-   while (dsp_counter > 0) {
-      u32 inc = 0, v = 0;   /* every path sets both before use; initialised only to silence -Wmaybe-uninitialized */
-      u64 ea, eb;
+   if (dsp_counter <= 0) goto aus;
+   head_val:
       if (__builtin_expect((pcp.all & t0m) != 0 || DL->dsp_dma_wait > 0, 0)) {   /* DMA pending: run one exact stage A iteration */
          DV_SYNC();
          dsp_counter = dv_langsam(DL, dsp_counter);
          DV_LOAD();
-         continue;
+         if (dsp_counter <= 0) goto aus;
+         goto head_val;
       }
-      {
-         const u32 instruction = DL->ProgramRam[pc];
+      pruef = 0;
+      DV_NEXT();
+   new_val: {   /* cold: SYNC/LOAD bracket, re-decode and fill the label offsets */
          dv_ent *const e = &s_vor[pc];
+         DV_SYNC(); dv_dekodiere(e, DL->ProgramRam[pc]); DV_LOAD();
          ea = e->a; eb = e->b;
-         if (__builtin_expect((u32)ea != instruction, 0)) {
-            /* cold: SYNC/LOAD bracket so that no state value lives across the call (register pressure) */
-            DV_SYNC(); dv_dekodiere(e, instruction); DV_LOAD();
-            ea = e->a; eb = e->b;
-         }
+         s_vorh[pc] = k_tab[(u32)(eb >> 32) & 0x1Fu];
+         s_vord[pc] = d_tab[(u32)(eb >> 46) & 7u];
+         alu.all = ac.all;
+         goto *(&&k_nop + s_vorh[pc]);
       }
-      alu.all = ac.all;
-      goto *(&&k_nop + k_tab[(u32)(eb >> 32) & 0x1Fu]);
 
       /* ---------- class 0: ALU ---------- */
    k_and:
@@ -501,13 +511,13 @@ static void __attribute__((noinline)) ScuDspExecVor(u32 timing) {
             else ac.all = alu.all;                                      // MOV ALU,A
          } else if (eb & (1ull << 44)) ac.all = 0;                      // CLR A
          inc = (u32)eb;
-         goto *(&&d_nix + d_tab[(u32)(eb >> 46) & 7u]);
+         goto *(&&d_nix + s_vord[pc]);
       }
       /* ---------- D1 bus (dw <= 0, so "Finish Previous DMA" is not needed) ---------- */
    d_imm_md:   /* MOV SImm,[d]: apply pending incFlg before writing */
       if (inc) DV_CTINC(inc);
       { const u32 dsh = (u32)(eb >> 59); inc = 0xFFu << dsh; DV_MD(dsh) = (u32)(ea >> 32); }
-      goto ende;
+      DV_TAIL_INC();
    d_imm_reg:
       if (inc) DV_CTINC(inc);
       inc = 0; v = (u32)(ea >> 32);
@@ -515,7 +525,7 @@ static void __attribute__((noinline)) ScuDspExecVor(u32 timing) {
    d_md_md:
       v = DV_MD((u32)(ea >> 32));
       DV_MD((u32)(eb >> 59)) = v;
-      goto ende;
+      DV_TAIL_INC();
    d_md_reg:
       v = DV_MD((u32)(ea >> 32));
       goto d_reg;
@@ -523,7 +533,7 @@ static void __attribute__((noinline)) ScuDspExecVor(u32 timing) {
    d_sp_reg: {
       const u32 n = (u32)(ea >> 32);
       v = (n == 0x9) ? (u32)alu.part.L : (n == 0xA) ? (u32)(alu.all >> 16) : 0xFFFFFFFFu;
-      if (((u32)(eb >> 46) & 7u) == DV_D1_SP_MD) { DV_MD((u32)(eb >> 59)) = v; goto ende; }
+      if (((u32)(eb >> 46) & 7u) == DV_D1_SP_MD) { DV_MD((u32)(eb >> 59)) = v; DV_TAIL_INC(); }
       goto d_reg; }
    d_reg:
       switch ((u32)(eb >> 59)) {
@@ -536,9 +546,9 @@ static void __attribute__((noinline)) ScuDspExecVor(u32 timing) {
          case 0xC: case 0xD: case 0xE: case 0xF: DV_CTSET((u32)(eb >> 59) & 3u, v); break;
          default: break;
       }
-      goto ende;
+      DV_TAIL_INC();
    d_nix:
-      goto ende;
+      DV_TAIL_INC();
 
       /* ---------- classes 2/3/1 ---------- */
    k_mvi:
@@ -557,16 +567,17 @@ static void __attribute__((noinline)) ScuDspExecVor(u32 timing) {
             default: break;
          }
       }
-      goto ende;
+      DV_TAIL_INC();
    k_jmp:
       if (jmp == (s32)0xffffffff && ((pcp.all & (u32)eb) != 0) == ((eb >> 40) & 1)) { jmp = (s32)(u32)(ea >> 32); DL->delayed = 0; }
-      goto ende0;
+      DV_TAIL0();
    k_lps:
       if (DL->LOP != 0) { jmp = (s32)pc; DL->delayed = 0; DL->LOP--; }
-      goto ende0;
+      DV_TAIL0();
    k_btm:
       if (DL->LOP != 0) { jmp = (s32)DL->TOP; DL->delayed = 0; DL->LOP--; }
-      goto ende0;
+      else DL->LOP = (u16)((DL->LOP - 1) & 0xFFF);   /* BTM always decrements LOP (same as ScuDspExecInner) */
+      DV_TAIL0();
    k_dma: {   /* dw <= 0, so "Finish Previous DMA" is not needed */
       const u32 instruction = (u32)ea;
       DL->dsp_dma_instruction = instruction;
@@ -585,13 +596,13 @@ static void __attribute__((noinline)) ScuDspExecVor(u32 timing) {
       DL->dsp_dma_wait = Counter >> 12; // DMA operation will be start when this count is zero
       DL->WA0M = DL->WA0;
       DL->RA0M = DL->RA0;
-      goto ende0; }
+      pruef = 1;
+      DV_TAIL0(); }
    k_end:
       /* dw <= 0: no open DMA here; only the first-END notification remains.
          All calls in one SYNC/LOAD bracket (cold; no state value lives across a call). */
       pcp.part.EX = 0;
       DV_SYNC();
-      (void)dv_enddma_an();
       if ((u32)ea & 0x8000000) {       // End with Interrupt
          DL->ProgControlPort.part.E = 1;
          ScuSendDSPEnd();
@@ -599,18 +610,13 @@ static void __attribute__((noinline)) ScuDspExecVor(u32 timing) {
       DV_LOAD();
       pcp.part.P = pc + 1;
       dsp_counter = 1;
-      goto ende0;
+      pruef = 1;
+      DV_TAIL0();
 
-   ende:
-      if (inc) DV_CTINC(inc);
+   end_pc:
+      DV_TAIL_INC();
    ende0:
-      DL->ALU.all = alu.all;
-      pc = (pc + 1u) & 0xFFu;                   /* u8 wrap-around */
-      if (__builtin_expect(jmp != (s32)0xFFFFFFFF, 0)) {   /* MVI -1 to PC leaves jmpaddr = 0xFFFFFFFF */
-         if (DL->delayed) { pc = (u8)jmp; jmp = (s32)0xFFFFFFFF; dsp_counter += 1; }
-         else DL->delayed = 1;
-      }
-      dsp_counter--;
-   }
+      DV_TAIL0();
+   aus:
    DV_SYNC();
 }

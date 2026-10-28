@@ -31,28 +31,6 @@ extern "C" {
 #include <math.h>
 #include <string.h> // strcat() for combining shader #define injections
 #include <time.h>
-/* Counters for the RBG VRAM upload path (read by vdp2.cpp, hence C++ linkage):
-   g_rbg_kopien   number of 512 KB VRAM copies
-   g_rbg_copy_ns  wall-clock ns spent in memcpy + glUnmapBuffer
-   g_rbg_map_ns   wall-clock ns spent in glMapBufferRange
-   g_rbg_mapspaet number of updates that had to map because onFinish() had not */
-/* No extern "C": vdp2.cpp references these as C++ symbols. */
-unsigned int       g_rbg_kopien   = 0;
-unsigned long long g_rbg_copy_ns  = 0;
-unsigned long long g_rbg_map_ns   = 0;
-unsigned int       g_rbg_mapspaet = 0;
-#include "instrument.h"
-#ifdef YABA_INSTRUMENT
-static inline void rbg_t0(struct timespec *t) { clock_gettime(CLOCK_MONOTONIC, t); }
-static inline void rbg_t1(const struct timespec *t0, unsigned long long *ziel) {
-  struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
-  *ziel += (unsigned long long)(t1.tv_sec - t0->tv_sec) * 1000000000ULL
-         + (unsigned long long)(t1.tv_nsec - t0->tv_nsec);
-}
-#else
-static inline void rbg_t0(struct timespec *) { }
-static inline void rbg_t1(const struct timespec *, unsigned long long *) { }
-#endif
 
 
 #if defined(HAVE_VULKAN)
@@ -74,9 +52,6 @@ const char prg_generate_rbg_base[] =
 "#version 430 \n"
 #endif
 "#pragma optionNV(inline all)\n"
-// Injected at runtime as either "" or "#define RBGFORCE_ACTIVE 1\n" (see
-// RBGFORCE_enabled()/init() below). Must precede main().
-"%s"
 "layout(local_size_x = %d, local_size_y = %d, local_size_z = 1) in;\n"
 "layout(rgba8, binding = 0)  uniform writeonly image2D outSurface;\n"
 "layout(std430, binding = 1) readonly buffer VDP2 { uint vram[]; };\n"
@@ -267,35 +242,6 @@ const char prg_generate_rbg_base[] =
 // Main
 //----------------------------------------------------------------------
 "void main(){ \n"
-// Debug aid: when RBGFORCE_ACTIVE is defined, fill the output with a constant
-// color as the very first statement of main() and return.
-"#ifdef RBGFORCE_ACTIVE\n"
-"  imageStore(outSurface, ivec2(gl_GlobalInvocationID.xy), vec4(1.0, 0.0, 1.0, 1.0));\n"
-"  return;\n"
-"#endif\n"
-// Debug aid (RBGDATA_ACTIVE_1): before any early-out logic, encode the first
-// VDP2 VRAM word as stripe brightness and show whether cram[0] and para[0].A
-// are non-zero at dispatch time.
-"#ifdef RBGDATA_ACTIVE_1\n"
-"  {\n"
-"    uint rbgdata_v0 = vram[0];\n"
-"    uint rbgdata_c0 = cram[0];\n"
-"    float rbgdata_pA_A = para[0].A;\n"
-"    ivec2 rbgdata_texel = ivec2(gl_GlobalInvocationID.xy);\n"
-"    ivec2 rbgdata_size = imageSize(outSurface);\n"
-"    if (rbgdata_texel.x >= rbgdata_size.x || rbgdata_texel.y >= rbgdata_size.y) return;\n"
-"    int rbgdata_band = (rbgdata_texel.y * 4) / max(rbgdata_size.y, 1);\n"
-"    uint rbgdata_byte;\n"
-"    if (rbgdata_band <= 0) { rbgdata_byte = rbgdata_v0 & 0xFFu; }\n"
-"    else if (rbgdata_band == 1) { rbgdata_byte = (rbgdata_v0 >> 8) & 0xFFu; }\n"
-"    else if (rbgdata_band == 2) { rbgdata_byte = (rbgdata_v0 >> 16) & 0xFFu; }\n"
-"    else { rbgdata_byte = (rbgdata_v0 >> 24) & 0xFFu; }\n"
-"    float rbgdata_g = (rbgdata_c0 != 0u) ? 1.0 : 0.0;\n"
-"    float rbgdata_b = (rbgdata_pA_A != 0.0) ? 1.0 : 0.0;\n"
-"    imageStore(outSurface, rbgdata_texel, vec4(float(rbgdata_byte) / 255.0, rbgdata_g, rbgdata_b, 1.0));\n"
-"    return;\n"
-"  }\n"
-"#endif\n"
 "  int x, y;\n"
 "  int paramid = 0;\n"
 "  int cellw;\n"
@@ -309,20 +255,13 @@ const char prg_generate_rbg_base[] =
 "  uint specialcolorfunction_in = 0u;\n"
 "  ivec2 texel = ivec2(gl_GlobalInvocationID.xy);\n"
 "  ivec2 size = imageSize(outSurface);\n"
-// Debug aid (RBGDATA_ACTIVE_4): output imageSize(outSurface) directly,
-// before the bounds check.
-"#ifdef RBGDATA_ACTIVE_4\n"
-"  imageStore(outSurface, ivec2(gl_GlobalInvocationID.xy), vec4(float(size.x) / 2048.0, float(size.y) / 2048.0, 0.0, 1.0));\n"
-"  return;\n"
-"#endif\n"
 "  if (texel.x >= size.x || texel.y >= size.y ) return;\n"
 "  float posx = float(texel.x) * hres_scale;\n"
 "  float posy = float(texel.y) * vres_scale;\n"
 "  specialfunction_in = (supplementdata >> 9) & 0x1u; \n"
 "  specialcolorfunction_in = (supplementdata >> 8) & 0x1u; \n";
 
-// Extra room for the "%s" define injection (RBGFORCE_ACTIVE and/or
-// RBGDATA_ACTIVE_<level>) on top of the local_size substitutions.
+// Room for the local_size substitutions.
 char prg_generate_rbg[ sizeof(prg_generate_rbg_base) + 256 ] = {};
 
 const char prg_rbg_rpmd0_2w[] =
@@ -511,13 +450,7 @@ const char prg_rbg_get_pattern_data_1w[] =
 "    break;\n"
 "  }\n"
 "  charaddr &= 0x3FFFu;\n"
-"  charaddr *= 0x20u;\n"
-// Debug aid (RBGDATA_ACTIVE_3): output charaddr (R/G) and patternname (B)
-// right after the 1-word pattern data address calculation.
-"#ifdef RBGDATA_ACTIVE_3\n"
-"  imageStore(outSurface, texel, vec4(float(charaddr & 0xFFu) / 255.0, float((charaddr >> 8) & 0xFFu) / 255.0, float(patternname & 0xFFu) / 255.0, 1.0));\n"
-"  return;\n"
-"#endif\n";
+"  charaddr *= 0x20u;\n";
 
 const char prg_rbg_get_pattern_data_2w[] =
 "  patternname = vram[addr>>2]; \n"
@@ -530,12 +463,7 @@ const char prg_rbg_get_pattern_data_2w[] =
 "  specialfunction_in = (tmp1 & 0x2000u) >> 13;\n"
 "  specialcolorfunction_in = (tmp1 & 0x1000u) >> 12;\n"
 "  charaddr &= 0x3FFFu;\n"
-"  charaddr *= 0x20u;\n"
-// 2-word variant of the RBGDATA_ACTIVE_3 debug output.
-"#ifdef RBGDATA_ACTIVE_3\n"
-"  imageStore(outSurface, texel, vec4(float(charaddr & 0xFFu) / 255.0, float((charaddr >> 8) & 0xFFu) / 255.0, float(patternname & 0xFFu) / 255.0, 1.0));\n"
-"  return;\n"
-"#endif\n";
+"  charaddr *= 0x20u;\n";
 
 const char prg_rbg_get_charaddr[] =
 "  cellw = 8; \n"
@@ -587,12 +515,6 @@ const char prg_rbg_getcolor_4bpp[] =
 "  else if( (dotaddr & 0x3u) == 2u ) dot >>= 16;\n"
 "  else if( (dotaddr & 0x3u) == 3u ) dot >>= 24;\n"
 "  if ( (x & 0x1) == 0 ) dot >>= 4;\n"
-// Debug aid (RBGDATA_ACTIVE_2): output "dot" right after extraction from VRAM,
-// before the transparency test (4bpp variant).
-"#ifdef RBGDATA_ACTIVE_2\n"
-"  imageStore(outSurface, texel, vec4(float(dot & 0xFu) / 15.0, float(dot & 0xFu) / 15.0, float(dot & 0xFu) / 15.0, 1.0));\n"
-"  return;\n"
-"#endif\n"
 "  if ( (dot & 0xFu) == 0u && transparencyenable != 0 ) { \n"
 "    cramindex = 0u; \n"
 "    alpha = 0.0;\n"
@@ -640,11 +562,6 @@ const char prg_rbg_getcolor_8bpp[] =
 "  else if( (dotaddr & 0x3u) == 2u ) dot >>= 16;\n"
 "  else if( (dotaddr & 0x3u) == 3u ) dot >>= 24;\n"
 "  dot = dot & 0xFFu; \n"
-// 8bpp variant of the RBGDATA_ACTIVE_2 debug output.
-"#ifdef RBGDATA_ACTIVE_2\n"
-"  imageStore(outSurface, texel, vec4(float(dot & 0xFFu) / 255.0, float(dot & 0xFFu) / 255.0, float(dot & 0xFFu) / 255.0, 1.0));\n"
-"  return;\n"
-"#endif\n"
 "  if ( dot == 0u && transparencyenable != 0 ) { \n"
 "    cramindex = 0u; \n"
 "    alpha = 0.0;\n"
@@ -688,12 +605,6 @@ const char prg_rbg_getcolor_16bpp_palette[] =
 "  dot = vram[dotaddr>>2]; \n"
 "  if( (dotaddr & 0x02u) != 0u ) { dot >>= 16; } \n"
 "  dot = (((dot) >> 8 & 0xFF) | ((dot) & 0xFF) << 8);\n"
-// 16bpp palette variant of the RBGDATA_ACTIVE_2 debug output; dot is 16 bits
-// wide, so low/high byte go to R/G.
-"#ifdef RBGDATA_ACTIVE_2\n"
-"  imageStore(outSurface, texel, vec4(float(dot & 0xFFu) / 255.0, float((dot >> 8) & 0xFFu) / 255.0, 0.0, 1.0));\n"
-"  return;\n"
-"#endif\n"
 "  if ( dot == 0 && transparencyenable != 0 ) { \n"
 "    cramindex = 0u; \n"
 "    alpha = 0.0;\n"
@@ -710,11 +621,6 @@ const char prg_rbg_getcolor_16bpp_rbg[] =
 "  dot = vram[dotaddr>>2]; \n"
 "  if( (dotaddr & 0x02u) != 0u ) { dot >>= 16; } \n"
 "  dot = (((dot >> 8) & 0xFFu) | ((dot) & 0xFFu) << 8);\n"
-// 16bpp RBG variant of the RBGDATA_ACTIVE_2 debug output.
-"#ifdef RBGDATA_ACTIVE_2\n"
-"  imageStore(outSurface, texel, vec4(float(dot & 0xFFu) / 255.0, float((dot >> 8) & 0xFFu) / 255.0, 0.0, 1.0));\n"
-"  return;\n"
-"#endif\n"
 "  if ( (dot&0x8000u) == 0u && transparencyenable != 0 ) { \n"
 "    cramindex = 0u; \n"
 "    alpha = 0.0;\n"
@@ -730,11 +636,6 @@ const char prg_rbg_getcolor_32bpp_rbg[] =
 "  uint dotaddr = charaddr + uint((y*cellw)+x) * 4u;\n"
 "  dot = vram[dotaddr>>2]; \n"
 "  dot = ((dot&0xFF000000u) >> 24 | ((dot >> 8) & 0xFF00u) | ((dot) & 0xFF00u) << 8 | (dot&0x000000FFu) << 24);\n"
-// 32bpp RBG variant of the RBGDATA_ACTIVE_2 debug output.
-"#ifdef RBGDATA_ACTIVE_2\n"
-"  imageStore(outSurface, texel, vec4(float(dot & 0xFFu) / 255.0, float((dot >> 8) & 0xFFu) / 255.0, float((dot >> 16) & 0xFFu) / 255.0, 1.0));\n"
-"  return;\n"
-"#endif\n"
 "  if ( (dot&0x80000000u) == 0u && transparencyenable != 0 ) { \n"
 "    cramindex = 0u; \n"
 "    alpha = 0.0;\n"
@@ -1026,72 +927,6 @@ struct RBGUniform {
   unsigned int priority;
 };
 
-// The CRAM binding (binding=5) is always established: the shader declares it
-// unconditionally, and on Mali-G31 an unbound storage binding makes every
-// input access fail, so the dispatch writes no pixels. Costs 4 KB of upload
-// per dispatch.
-static inline bool RBGCRAMOFF_enabled() {
-  return false;
-}
-
-/* Program binary cache for the RBG compute programs (disabled).
-   Key = FNV-1a/64 over all source parts + GL_RENDERER + GL_VERSION; stored as
-   $HOME/.yabasanshiro/shadercache/rbg_<hex>.bin. A hit uses glProgramBinary
-   instead of compiling; a failed load deletes the file and falls back to
-   normal compilation. */
-#include <sys/stat.h>
-#include <unistd.h>
-static int ShaderCacheAn(void) {
-  return 0;
-}
-static unsigned long long ShaderCacheSchluessel(int count, const GLchar** prg_strs) {
-  unsigned long long h = 1469598103934665603ULL;
-  for (int i = 0; i < count; i++) for (const unsigned char *c = (const unsigned char*)prg_strs[i]; c && *c; c++) { h ^= *c; h *= 1099511628211ULL; }
-  const char *zus[2] = { (const char*)glGetString(GL_RENDERER), (const char*)glGetString(GL_VERSION) };
-  for (int i = 0; i < 2; i++) for (const unsigned char *c = (const unsigned char*)zus[i]; c && *c; c++) { h ^= *c; h *= 1099511628211ULL; }
-  return h;
-}
-static void ShaderCachePfad(unsigned long long k, char *buf, size_t n) {
-  const char *home = getenv("HOME"); if (!home) home = "/home/ark";
-  char dir[512]; snprintf(dir, sizeof(dir), "%s/.yabasanshiro/shadercache", home); mkdir(dir, 0755);
-  snprintf(buf, n, "%s/rbg_%016llx.bin", dir, k);
-}
-static GLuint ShaderCacheLaden(unsigned long long k) {
-  char pf[600]; ShaderCachePfad(k, pf, sizeof(pf));
-  FILE *fp = fopen(pf, "rb"); if (!fp) return 0;
-  char magic[4]; GLenum fmt = 0; GLint len = 0; GLuint prog = 0;
-  if (fread(magic, 1, 4, fp) == 4 && memcmp(magic, "YSC1", 4) == 0 && fread(&fmt, sizeof(fmt), 1, fp) == 1 &&
-      fread(&len, sizeof(len), 1, fp) == 1 && len > 0 && len < (64 << 20)) {
-    void *daten = malloc(len);
-    if (daten && fread(daten, 1, len, fp) == (size_t)len) {
-      prog = glCreateProgram();
-      glProgramBinary(prog, fmt, daten, len);
-      GLint ok = GL_FALSE; glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-      if (ok != GL_TRUE) { glDeleteProgram(prog); prog = 0; }
-    }
-    free(daten);
-  }
-  fclose(fp);
-  while (glGetError() != GL_NO_ERROR) {}   /* a failed load must not trigger ErrorHandle later */
-  if (!prog) unlink(pf);
-  return prog;
-}
-static void ShaderCacheSpeichern(GLuint prog, unsigned long long k) {
-  GLint len = 0; glGetProgramiv(prog, GL_PROGRAM_BINARY_LENGTH, &len);
-  if (len <= 0) { while (glGetError() != GL_NO_ERROR) {} return; }
-  void *daten = malloc(len); GLenum fmt = 0; GLsizei geschrieben = 0;
-  if (!daten) return;
-  glGetProgramBinary(prog, len, &geschrieben, &fmt, daten);
-  while (glGetError() != GL_NO_ERROR) {}
-  if (geschrieben > 0) {
-    char pf[600], tmp[620]; ShaderCachePfad(k, pf, sizeof(pf)); snprintf(tmp, sizeof(tmp), "%s.tmp", pf);
-    FILE *fp = fopen(tmp, "wb");
-    if (fp) { GLint gl = geschrieben; fwrite("YSC1", 1, 4, fp); fwrite(&fmt, sizeof(fmt), 1, fp); fwrite(&gl, sizeof(gl), 1, fp);
-      fwrite(daten, 1, geschrieben, fp); fclose(fp); rename(tmp, pf); }
-  }
-  free(daten);
-}
-
 class RBGGenerator {
   GLuint prg_rbg_0_2w_bitmap_4bpp_ = 0;
   GLuint prg_rbg_0_2w_bitmap_8bpp_ = 0;
@@ -1312,9 +1147,6 @@ public:
   }
 
   GLuint createProgram(int count, const GLchar** prg_strs) {
-    const int sc_an_ = ShaderCacheAn();
-    const unsigned long long sc_k_ = sc_an_ ? ShaderCacheSchluessel(count, prg_strs) : 0;
-    if (sc_an_) { GLuint sc_p_ = ShaderCacheLaden(sc_k_); if (sc_p_) return sc_p_; }
     GLuint result = glCreateShader(GL_COMPUTE_SHADER);
     glShaderSource(result, count, prg_strs, NULL);
     glCompileShader(result);
@@ -1338,7 +1170,6 @@ public:
     }
     GLuint program = glCreateProgram();
     glAttachShader(program, result);
-    if (sc_an_) glProgramParameteri(program, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
     glLinkProgram(program);
     glDetachShader(program, result);
     glGetProgramiv(program, GL_LINK_STATUS, &status);
@@ -1359,7 +1190,6 @@ public:
       abort();
       delete[] info;
     }
-    if (sc_an_) ShaderCacheSpeichern(program, sc_k_);
     return program;
   }
 
@@ -1401,8 +1231,7 @@ public:
       int length = sizeof(prg_generate_rbg_base) + 256;
       // Runs once per process; all lazily compiled RBG program variants share the
       // global prg_generate_rbg buffer.
-      char active_defines[128] = "";
-      snprintf(prg_generate_rbg, length, prg_generate_rbg_base, active_defines, local_size_x, local_size_y);
+      snprintf(prg_generate_rbg, length, prg_generate_rbg_base, local_size_x, local_size_y);
 
     }
 
@@ -2715,27 +2544,19 @@ public:
     ErrorHandle("glUseProgram");
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_vram_);
-    //glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 0x80000, (void*)Vdp2RamRender);
-    { struct timespec _r0;
-      if (mapped_vram == nullptr) {
-        INSTR(g_rbg_mapspaet++);      /* onFinish() did not premap: blocks here */
-        rbg_t0(&_r0);
-        mapped_vram = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 0x80000, GL_MAP_WRITE_BIT);
-        rbg_t1(&_r0, &g_rbg_map_ns);
-      }
-      rbg_t0(&_r0);
-      memcpy(mapped_vram, Vdp2RamRender, 0x80000);
-      glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
-      rbg_t1(&_r0, &g_rbg_copy_ns);
-      INSTR(g_rbg_kopien++);
-      mapped_vram = nullptr; }
+    if (mapped_vram == nullptr) {
+      /* onFinish() did not premap: blocks here */
+      mapped_vram = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 0x80000, GL_MAP_WRITE_BIT);
+    }
+    memcpy(mapped_vram, Vdp2RamRender, 0x80000);
+    glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    mapped_vram = nullptr;
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_vram_);
     ErrorHandle("glBindBufferBase");
 
-    const bool cram_alt_noetig = (rbg->info.specialcolormode == 3
-                                  || paraA.k_mem_type != 0
-                                  || paraB.k_mem_type != 0);
-    if (RBGCRAMOFF_enabled() ? cram_alt_noetig : true) {
+    /* The CRAM binding (binding=5) is always set up: the shader declares it unconditionally, and on Mali-G31
+       an unbound storage binding makes every input access fail, so the dispatch writes no pixels. */
+    {
       if (ssbo_cram_ == 0) {
         glGenBuffers(1, &ssbo_cram_);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_cram_);
@@ -2850,9 +2671,7 @@ public:
       /* Do not use INVALIDATE_BUFFER_BIT here: onFinish() runs at frame end while
          the dispatch of the same frame may still be queued; invalidating in place
          would let it read undefined VRAM. */
-      { struct timespec _r0; rbg_t0(&_r0);
-        mapped_vram = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 0x80000, GL_MAP_WRITE_BIT);
-        rbg_t1(&_r0, &g_rbg_map_ns); }
+      mapped_vram = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 0x80000, GL_MAP_WRITE_BIT);
       glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
     }
   }

@@ -53,9 +53,10 @@ struct RAStatus {
   bool hardcore;          /* hardcore selected in the config */
   bool hardcore_active;   /* hardcore is in force for the running game */
   bool indicators;        /* indicator box (trackers, challenges, progress) shown */
+  bool cheats;            /* a cheat was on since the last reset: nothing is unlocked */
   RAStatus() : state(RA_NOT_CONFIGURED), score(0), game_loaded(false),
                ach_unlocked(0), ach_total(0), hardcore(false),
-               hardcore_active(false), indicators(true) {}
+               hardcore_active(false), indicators(true), cheats(false) {}
 };
 
 /* Read ~/.yabasanshiro/retroachievements.cfg; with a token or a password
@@ -95,8 +96,13 @@ void RA_DoFrame();
 /* Call while the menu is open instead of RA_DoFrame(). */
 void RA_Idle();
 
-/* Call when the emulator is reset. */
-void RA_OnReset();
+/* Call when the emulator is reset; cheats_on = a cheat is still switched on. */
+void RA_OnReset(bool cheats_on);
+
+/* Call when a cheat is switched on (also at game start). Until the next reset
+   with all cheats off no achievement or leaderboard is evaluated, in casual
+   and in hardcore mode. */
+void RA_CheatsUsed();
 
 /* Hardcore: logged in, game loaded and hardcore in force. */
 bool RA_HardcoreActive();

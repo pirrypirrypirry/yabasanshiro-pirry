@@ -21,11 +21,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 #include <stdio.h>
 #include <stdlib.h>
-#include "../instrument.h"
 
-/* Diagnostic checks in the hot execution path are fixed to constant false, so
-   the compiler removes them. Development counters are compiled in only with
-   YABA_INSTRUMENT (instrument.h). */
 #include <string.h>
 #include <strings.h>
 #include <malloc.h>
@@ -68,25 +64,16 @@ extern "C" unsigned long long g_sync_cycles[2];   /* DynarecSh2CInterface.cpp */
 
 
 
-/* The counters must be defined outside the anonymous namespace (which starts
-   just below), otherwise they get internal linkage and vdp2.cpp cannot link to
-   them. */
-/* Not gated: these are the idle jumps per CPU, and the bgm:l46m ratio is the
-   criterion for an idle-loop failure. They cost far less than the block entry
-   counters. alignas keeps master and slave off the same cache line. */
+/* Idle-loop skips of the master, read once per second by vdp2.cpp for the
+   adaptive mode below. Defined outside the anonymous namespace (external
+   linkage); own cache line, the slave runs on another core. */
 alignas(64) unsigned int g_ls46_m = 0;
-alignas(64) unsigned int g_ls46_s = 0;
 
-/* Defined before `namespace {`, otherwise internal linkage and a link error.
-   Mode: 0 off, 1 always on, 2 adaptive (decided once per second in vdp2.cpp,
-   ZserstAdaptSekunde). */
-volatile int g_zserst_adapt_an = 0;
-int ZserstModus() { return 2; }
+/* Adaptive first-slice rule (see Execute()), switched once per second in
+   vdp2.cpp. Defined before `namespace {` for external linkage. */
+volatile int g_firstslice_adapt_on = 0;
 
 
-/* Entries dropped because the CHAIN2 / NACHPRUEF tables were full (counted
-   only with YABA_INSTRUMENT). */
-unsigned int g_c2_verworfen = 0, g_np_verworfen = 0;
 
 namespace {
 
@@ -101,93 +88,75 @@ namespace {
    pass as harmless. The table itself is left untouched; this function
    corrects the value. */
 
-inline unsigned OPFIX_write(unsigned op, unsigned aus_tabelle) {
+inline unsigned OPFIX_write(unsigned op, unsigned table_value) {
   if ((op & 0xF00F) == 0x6006) return 0;  /* mov.l @Rm+,Rn    = read  */
   if ((op & 0xF00F) == 0x2005) return 1;  /* mov.w Rm,@-Rn    = write */
   if ((op & 0xFF00) == 0x8400) return 0;  /* mov.b @(d,Rm),R0 = read  */
   if ((op & 0xFF00) == 0x8000) return 1;  /* mov.b R0,@(d,Rn) = write */
-  return aus_tabelle;
+  return table_value;
 }
 
-/* Sign fix for the branch target of bra/bsr. The 12-bit displacement is
-   sign-extended in "temp", but the assignment to jumppc used the unsigned raw
-   value, so every backward bra looked like a forward jump to the idle-loop
-   detection. Every wait loop closed by bra was affected; loops closed by
-   bt/bf use the 8-bit path with (signed char) and were correct. This is a fix,
-   not a diagnostic tool, hence no NODIAG guard. */
-inline bool BRAFIX_enabled() { return true; }
 
-/* The adjacency condition of the two-block cycle (`adj_luecklos`) is
-   deliberately not relaxed: relaxing it was measured harmful in several
-   titles. */
+/* The adjacency condition of the two-block cycle (`adj_gapless`) is
+   not relaxed: relaxing it causes regressions in several games. */
 
 
-inline bool CHAIN2_enabled() { return true; }
 /* Partner ranges of the two-block idle cycles, deliberately kept outside
-   struct Block: two extra u32 in Block cost several fps in every game even
+   struct Block: two extra u32 in Block slow down every game noticeably, even
    with the fix off, because Block contains a 4 KB code buffer and is walked
    millions of times (size and alignment change the cache behaviour). Only the
    actually marked blocks are stored here, so the table is almost always
-   resolved at the first entry; chain2_letzter remembers the last hit, because
+   resolved at the first entry; chain2_last remembers the last hit, because
    the same loop is queried millions of times in a row. */
-struct Chain2Eintrag { u32 block_b; u32 partner_b; u32 partner_e; };
+struct Chain2Entry { u32 block_b; u32 partner_b; u32 partner_e; };
 static const unsigned CHAIN2_MAX = 64;
 
-static Chain2Eintrag chain2_tab[CHAIN2_MAX];
-static unsigned chain2_anzahl = 0;
+static Chain2Entry chain2_tab[CHAIN2_MAX];
+static unsigned chain2_count = 0;
 
-/* Counters without a gate (they are not in the hot path): g_ls46_m/s count the
-   only real idle-jump return (loopskip_cnt_ counts eight returns, including
-   BIOS calls and undecoded cases); g_c2_verworfen counts cycles silently
-   dropped because chain2_tab (CHAIN2_MAX entries) was full; g_np_verworfen
-   the same for nachpruef_tab. The definitions stand before `namespace {`: inside the
-   anonymous namespace they would get internal linkage and vdp2.cpp could not
-   link to them. */
-static unsigned chain2_letzter = 0;
+static unsigned chain2_last = 0;
 
 /* Remove an already registered cycle again. Removing the chain2_tab entry is
-   enough: without it Chain2ImPartner() returns false, so the runtime check
+   enough: without it Chain2InPartner() returns false, so the runtime check
    does not see the program counter "in block". The BLOCK_LOOP flag may stay. */
-static void Chain2VergessenPartner(u32 adr)
+static void Chain2ForgetPartner(u32 adr)
 {
   unsigned d = 0;
-  for (unsigned i = 0; i < chain2_anzahl; i++) {
+  for (unsigned i = 0; i < chain2_count; i++) {
     if (chain2_tab[i].partner_b == adr || chain2_tab[i].block_b == adr) {
       continue;
     }
     chain2_tab[d++] = chain2_tab[i];
   }
-  chain2_anzahl = d;
-  chain2_letzter = 0;
+  chain2_count = d;
+  chain2_last = 0;
 }
 
-/* Like Chain2Merken, but an EXISTING entry is left untouched. Chain2Merken
+/* Like Chain2Remember, but an EXISTING entry is left untouched. Chain2Remember
    overwrites partner_b/partner_e if block_b is already in the table, which the
    late check must not do (a candidate that has a valid partner via the normal
    path would get the range of another target). chain2_tab also only holds
    CHAIN2_MAX entries, so non-firing late additions would displace real
    cycles. */
-static void Chain2MerkenNurNeu(u32 block_b, u32 partner_b, u32 partner_e) {
-  for (unsigned i = 0; i < chain2_anzahl; i++)
+static void Chain2RememberNewOnly(u32 block_b, u32 partner_b, u32 partner_e) {
+  for (unsigned i = 0; i < chain2_count; i++)
     if (chain2_tab[i].block_b == block_b) return;  /* already present: do not touch */
-  if (chain2_anzahl < CHAIN2_MAX) {
-    chain2_tab[chain2_anzahl].block_b   = block_b;
-    chain2_tab[chain2_anzahl].partner_b = partner_b;
-    chain2_tab[chain2_anzahl].partner_e = partner_e;
-    chain2_anzahl++;
+  if (chain2_count < CHAIN2_MAX) {
+    chain2_tab[chain2_count].block_b   = block_b;
+    chain2_tab[chain2_count].partner_b = partner_b;
+    chain2_tab[chain2_count].partner_e = partner_e;
+    chain2_count++;
   }
-  else INSTR(g_c2_verworfen++);
 }
 
 /* Real cycle test instead of adjacency. Block 1 ends at one address and block
-   2 begins further on; `adj_luecklos` asks whether block 1 falls through into
+   2 begins further on; `adj_gapless` asks whether block 1 falls through into
    block 2, which fails for a cycle that jumps over a gap. Adjacency was only
    ever a proxy for "the two blocks form a closed cycle". Here block 1 must end
    with a jump whose target is block 2; that block 2 jumps back to block 1 is
    already known at the call site. So the cycle is verified in both
    directions, which is stricter than adjacency: a coincidentally adjacent
-   block without a branch back is rejected. Not relaxed, as relaxing the
-   condition was measured harmful. No new field in struct Block (it costs
+   block without a branch back is rejected. Not relaxed (see above). No new field in struct Block (it costs
    speed) and no new table; the final instruction of block 1 is read and
    decoded once, when block 2 is translated. */
 /* `page->e_addr = addr-2` is the address of a block's LAST instruction. The
@@ -199,23 +168,9 @@ static void Chain2MerkenNurNeu(u32 block_b, u32 partner_b, u32 partner_e) {
    BLOCK_LOOP is set in several places: the SLEEP opcode, two fixed
    instruction patterns (tst #imm,r0 / bt and tst r0,r0 / bt.s), the
    single-block case (jumppc inside the block, write-free), the two-block case
-   (CHAIN2/ZYKEL2) and the late check. */
-/* RANDFIX2: the partner range check includes the last instruction (<= instead
-   of <); see Chain2ImPartner. */
-static bool RANDFIX2_enabled() { return true; }
+   (CHAIN2/CYCLE2) and the late check. */
 
-
-/* ZYKSLAVE: see the long comment in Execute(). */
-/* ZSERST: see the explanation at the point of effect in Execute(). */
-static bool ZSERST_enabled() {
-  const int m = ZserstModus();
-  return m == 1 || (m == 2 && g_zserst_adapt_an);
-}
-static bool ZYKSLAVE_enabled() { return true; }
-
-static bool ZYKEL2_enabled() { return true; }
-
-/* Does the block b_addr..e_addr end with a jump to `ziel`? The last two
+/* Does the block b_addr..e_addr end with a jump to `goal`? The last two
    instruction slots are checked: for a delayed branch e_addr is the delay slot
    and the branch instruction precedes it. Only PC-relative branches; jmp/rts
    through a register cannot be resolved statically and deliberately give
@@ -234,19 +189,14 @@ static bool ZYKEL2_enabled() { return true; }
    fixed-point iteration over several rounds is needed.
    Deliberately conservative: only `mov Rm,Rn` carries the marker on, `@Rm+`
    has no special case, and when in doubt the answer is false (the previous
-   behaviour). No new field in struct Block (that measurably cost speed).
+   behaviour). No new field in struct Block (that slows everything down).
    This runs in EmmitCode for every translated block, so its cost matters; the
    block words are read only once (see below). */
-/* Fixed level 4: cycle search plus constant-base relaxation. */
-static int WANDERFIX_stufe() { return 4; }
-/* Explicit extern "C" linkage; the reader in vdp2.cpp declares it identically.
-   Free-running and never reset: the reader takes per-second differences. */
-extern "C" unsigned long long g_wanderfix_abgelehnt = 0;  /* number of rejected cycles */
 
 /* True if the range [b_addr..e_addr] contains a load whose base register is
    loaded from memory in the same range (or copied by mov from such a
    register). */
-static bool SchleifeWandert(u32 b_addr, u32 e_addr)
+static bool LoopAddressWanders(u32 b_addr, u32 e_addr)
 {
   if (e_addr < b_addr) return false;
   if ((e_addr - b_addr) > 256) return false;  /* safety net */
@@ -255,12 +205,12 @@ static bool SchleifeWandert(u32 b_addr, u32 e_addr)
      load would otherwise call MappedMemoryReadWord up to ~8300 times per call,
      and this function runs in EmmitCode for every translated block. Nothing
      writes within one call, so every read site sees the same value as before;
-     no predicate, order or exit condition changed. ZykelSpringtNach() still
+     no predicate, order or exit condition changed. CycleJumpsTo() still
      reads directly. */
-  const u32 worte = ((e_addr - b_addr) >> 1) + 1;
-  if (worte > 129) return false;  /* belt and braces */
+  const u32 words = ((e_addr - b_addr) >> 1) + 1;
+  if (words > 129) return false;  /* safety limit */
   u16 w[129];
-  for (u32 i = 0; i < worte; i++)
+  for (u32 i = 0; i < words; i++)
     w[i] = MappedMemoryReadWord(b_addr + (i << 1), NULL);
 
   /* Wandering detection. A load wanders only if its address depends
@@ -268,12 +218,11 @@ static bool SchleifeWandert(u32 b_addr, u32 e_addr)
      or via copies) derives from r again (e.g. r2 = *r3, r3 = r2).
      Post-increment (`@Rm+`) is the trivial self-cycle. The dependency graph of
      one loop pass is built, and the question is whether the base register of a
-     load lies on a cycle containing at least one load edge. The callers check
-     `WANDERFIX_stufe() && SchleifeWandert(...)`, so there is no gate here. */
+     load lies on a cycle containing at least one load edge. */
   {
-    int  abh[16];  /* abh[r] = register r was last derived from */
-    bool per_laden[16];  /* ... through a memory access? */
-    for (int i = 0; i < 16; i++) { abh[i] = -1; per_laden[i] = false; }
+    int  dep[16];  /* dep[r] = register r was last derived from */
+    bool by_load[16];  /* ... through a memory access? */
+    for (int i = 0; i < 16; i++) { dep[i] = -1; by_load[i] = false; }
 
     /* Pass 1: collect the last assignment per register */
     for (u32 a = b_addr; a <= e_addr; a += 2) {
@@ -283,76 +232,58 @@ static bool SchleifeWandert(u32 b_addr, u32 e_addr)
 
       if ((op & 0xF00F) == 0x6004 || (op & 0xF00F) == 0x6005
        || (op & 0xF00F) == 0x6006) {            /* mov.X @Rm+,Rn  */
-        abh[m] = m; per_laden[m] = true;  /* Rm increments itself */
-        abh[n] = m; per_laden[n] = true;
+        dep[m] = m; by_load[m] = true;  /* Rm increments itself */
+        dep[n] = m; by_load[n] = true;
       }
       else if ((op & 0xF00F) == 0x6000 || (op & 0xF00F) == 0x6001
             || (op & 0xF00F) == 0x6002          /* mov.X @Rm,Rn   */
             || (op & 0xF000) == 0x5000          /* mov.l @(d,Rm),Rn */
             || (op & 0xF00F) == 0x000C || (op & 0xF00F) == 0x000D
             || (op & 0xF00F) == 0x000E) {       /* mov.X @(R0,Rm),Rn */
-        abh[n] = m; per_laden[n] = true;
+        dep[n] = m; by_load[n] = true;
       }
       else if ((op & 0xFF00) == 0x8400
             || (op & 0xFF00) == 0x8500) {       /* mov.X @(d,Rm),R0 */
-        abh[0] = m; per_laden[0] = true;
+        dep[0] = m; by_load[0] = true;
       }
-      else if ((op & 0xF00F) == 0x6003) {       /* mov Rm,Rn (Kopie) */
-        abh[n] = m; per_laden[n] = false;
-      }
-      /* Arithmetic on the base register is also an edge. Example:
-         `add #4,r2 ; mov.l @r2,r1 ; cmp/eq ; bf` scans an array, but without
-         an edge abh[2] would stay at its old value and the block would be
-         skipped as idle. Same treatment as `mov.X @Rm+,Rn`, which sets
-         abh[m] = m. It only takes effect if the wandering register is the base
-         of a load, so a loop counter (`add #1,r0 ; mov.l @r5,r1 ; tst ; bt`)
-         with a constant base is still skipped. SLEEP and the fixed wait
-         patterns bypass this check. Only applied at stage 5. */
-      else if (WANDERFIX_stufe() >= 5
-            && ((op & 0xF000) == 0x7000            /* add #imm,Rn        */
-             || (op & 0xF00F) == 0x300C            /* add Rm,Rn          */
-             || (op & 0xF00F) == 0x3008            /* sub Rm,Rn          */
-             || (op & 0xF0FF) == 0x4000            /* shll Rn            */
-             || (op & 0xF0FF) == 0x4010)) {        /* dt Rn              */
-        abh[n] = n; per_laden[n] = true;   /* Rn modifies itself */
+      else if ((op & 0xF00F) == 0x6003) {       /* mov Rm,Rn (copy) */
+        dep[n] = m; by_load[n] = false;
       }
       /* A register set to a constant breaks the chain. Example:
          `mov.l @(disp,PC),r0` before `mov.l @r0,r0` makes r0 the same fixed
          address on every pass, so the loop waits instead of wandering. The
          loop above only knows a few load forms and would otherwise leave
-         abh[n] at its old value. Only cases where the target certainly becomes
+         dep[n] at its old value. Only cases where the target certainly becomes
          a constant; `add #imm,Rn` does not belong here (Rn stays dependent on
          itself). */
-      else if (WANDERFIX_stufe() >= 3
-            && ((op & 0xF000) == 0xE000          /* mov #imm,Rn        */
-             || (op & 0xF000) == 0xD000          /* mov.l @(disp,PC),Rn */
-             || (op & 0xF000) == 0x9000)) {      /* mov.w @(disp,PC),Rn */
-        abh[n] = -1; per_laden[n] = false;
+      else if ((op & 0xF000) == 0xE000          /* mov #imm,Rn        */
+            || (op & 0xF000) == 0xD000          /* mov.l @(disp,PC),Rn */
+            || (op & 0xF000) == 0x9000) {       /* mov.w @(disp,PC),Rn */
+        dep[n] = -1; by_load[n] = false;
       }
-      else if (WANDERFIX_stufe() >= 3
-            && (op & 0xFF00) == 0xC700) {        /* mova @(disp,PC),R0 */
-        abh[0] = -1; per_laden[0] = false;
+      else if ((op & 0xFF00) == 0xC700) {       /* mova @(disp,PC),R0 */
+        dep[0] = -1; by_load[0] = false;
       }
-      /* anything else: no address dependency that we track */
+      /* anything else: no tracked address dependency */
     }
-    /* abh[] only holds the LAST assignment per register (a snapshot at block
+    /* dep[] only holds the LAST assignment per register (a snapshot at block
        end, not a sequence), so the assignment above is overwritten by a later
        load. The real check is the constant-before-load test below. */
 
     /* wandert[r]: trace back from register r; if the path returns to r and at
        least one load was on it, it is a cycle. */
-    unsigned int wandert = 0;
+    unsigned int wanders = 0;
     for (int r = 0; r < 16; r++) {
       int  k = r;
-      bool lade_kante = false;
-      for (int schritt = 0; schritt < 16; schritt++) {
-        if (per_laden[k]) lade_kante = true;
-        k = abh[k];
+      bool load_edge = false;
+      for (int step_val = 0; step_val < 16; step_val++) {
+        if (by_load[k]) load_edge = true;
+        k = dep[k];
         if (k < 0) break;  /* chain ends: no cycle */
-        if (k == r) { if (lade_kante) wandert |= (1u << r); break; }
+        if (k == r) { if (load_edge) wanders |= (1u << r); break; }
       }
     }
-    if (wandert == 0) return false;
+    if (wanders == 0) return false;
 
     /* Pass 2: does a load use a wandering base register? */
     for (u32 a = b_addr; a <= e_addr; a += 2) {
@@ -378,17 +309,17 @@ static bool SchleifeWandert(u32 b_addr, u32 e_addr)
          `mov #imm` and `mova`; `add #imm,Rn` stays out, because Rn then stays
          dependent on itself. Looks backwards only, down to b_addr: what comes
          after the load only matters in the next pass. */
-      if (basis >= 0 && (wandert & (1u << basis)) && WANDERFIX_stufe() >= 4) {
-        bool konst_davor = false;
+      if (basis >= 0 && (wanders & (1u << basis))) {
+        bool const_before = false;
         for (u32 d = b_addr; d < a; d += 2) {
           const u16 od = w[(d - b_addr) >> 1];
           const int zn = (od >> 8) & 0xF;
           if (((od & 0xF000) == 0xD000 || (od & 0xF000) == 0x9000
-            || (od & 0xF000) == 0xE000) && zn == basis) { konst_davor = true; }
-          else if ((od & 0xFF00) == 0xC700 && basis == 0) { konst_davor = true; }
+            || (od & 0xF000) == 0xE000) && zn == basis) { const_before = true; }
+          else if ((od & 0xFF00) == 0xC700 && basis == 0) { const_before = true; }
           /* If the register is reloaded from memory afterwards, the constant no
              longer counts. All load forms that pass 1 recognises must be
-             covered here; a missing one would let a genuinely wandering cycle
+             covered here; a missing one would let a wandering cycle
              through as idle. For `@Rm+` the base register itself is also
              invalidated if it is Rm, hence the second condition on zm. */
           else if ((((od & 0xF00F) == 0x6000 || (od & 0xF00F) == 0x6001
@@ -402,14 +333,14 @@ static bool SchleifeWandert(u32 b_addr, u32 e_addr)
                   || (od & 0xF00F) == 0x6006) && ((od >> 4) & 0xF) == basis)
                 || (((od & 0xFF00) == 0x8400 || (od & 0xFF00) == 0x8500)
                   && basis == 0))
-               { konst_davor = false; }
+               { const_before = false; }
         }
-        if (konst_davor) {
+        if (const_before) {
           continue;  /* this load does not indicate wandering */
         }
       }
 
-      if (basis >= 0 && (wandert & (1u << basis))) {
+      if (basis >= 0 && (wanders & (1u << basis))) {
         return true;
       }
     }
@@ -436,15 +367,8 @@ static bool SchleifeWandert(u32 b_addr, u32 e_addr)
    Such a loop cannot wait for anything external. Poll loops, `bf $`/`bra $`
    and tst #imm,r0/bt are unaffected. Cost: only when translating a cycle
    candidate, O(n) over at most 2x65 words. */
-static int RECHENZYK_an() {
-  static int v = -1;
-  if (v < 0) {
-    v = 1; /* always enabled */
-  }
-  return v;
-}
 /* Returns 0 if an unknown or reading instruction is found => do not reject the cycle. */
-static int RechenZykScan(u32 b, u32 e, unsigned *vgl, unsigned *fort, unsigned *neu, int *bed)
+static int ComputeLoopScan(u32 b, u32 e, unsigned *cmp_op, unsigned *cont, unsigned *new_val, int *cond_op)
 {
   if (e < b || (e - b) > 128) return 0;
   for (u32 a = b; a <= e; a += 2) {
@@ -453,75 +377,68 @@ static int RechenZykScan(u32 b, u32 e, unsigned *vgl, unsigned *fort, unsigned *
     switch (op >> 12) {
       case 0x0:
         if (op == 0x0009 || op == 0x0008 || op == 0x0018) break;        /* nop, clrt, sett */
-        if ((op & 0xF0FF) == 0x0029) { *neu |= 1u << n; break; }        /* movt Rn */
+        if ((op & 0xF0FF) == 0x0029) { *new_val |= 1u << n; break; }        /* movt Rn */
         return 0;
       case 0x2:
-        if ((op & 0xF) == 0x8) { *vgl |= (1u << n) | (1u << m); break; } /* tst Rm,Rn */
+        if ((op & 0xF) == 0x8) { *cmp_op |= (1u << n) | (1u << m); break; } /* tst Rm,Rn */
         if ((op & 0xF) >= 0x9 && (op & 0xF) <= 0xB) break;              /* and/xor/or Rm,Rn */
         return 0;
       case 0x3:
         switch (op & 0xF) {
           case 0x0: case 0x2: case 0x3: case 0x6: case 0x7:
-            *vgl |= (1u << n) | (1u << m); break;                         /* cmp/eq,hs,ge,hi,gt */
-          case 0x8: case 0xC: *fort |= 1u << n; break;                    /* sub, add Rm,Rn */
+            *cmp_op |= (1u << n) | (1u << m); break;                         /* cmp/eq,hs,ge,hi,gt */
+          case 0x8: case 0xC: *cont |= 1u << n; break;                    /* sub, add Rm,Rn */
           default: return 0;
         }
         break;
       case 0x4:
         switch (op & 0xFF) {
-          case 0x10: *vgl |= 1u << n; *fort |= 1u << n; break;            /* dt Rn */
-          case 0x11: case 0x15: *vgl |= 1u << n; break;                   /* cmp/pz, cmp/pl */
+          case 0x10: *cmp_op |= 1u << n; *cont |= 1u << n; break;            /* dt Rn */
+          case 0x11: case 0x15: *cmp_op |= 1u << n; break;                   /* cmp/pz, cmp/pl */
           case 0x00: case 0x01: case 0x04: case 0x05: case 0x08: case 0x09:
           case 0x18: case 0x19: case 0x20: case 0x21: case 0x24: case 0x25:
           case 0x28: case 0x29:
-            *fort |= 1u << n; break;  /* shift/rotate instructions */
+            *cont |= 1u << n; break;  /* shift/rotate instructions */
           default: return 0;
         }
         break;
       case 0x6:
         switch (op & 0xF) {
-          case 0x3: *neu |= 1u << n; break;                               /* mov Rm,Rn */
-          case 0xB: if (n == m) *fort |= 1u << n; else *neu |= 1u << n; break; /* neg */
+          case 0x3: *new_val |= 1u << n; break;                               /* mov Rm,Rn */
+          case 0xB: if (n == m) *cont |= 1u << n; else *new_val |= 1u << n; break; /* neg */
           case 0xC: case 0xD: case 0xE: case 0xF:
-            if (n != m) *neu |= 1u << n; break;                           /* extu/exts */
+            if (n != m) *new_val |= 1u << n; break;                           /* extu/exts */
           default: return 0;  /* loads etc. */
         }
         break;
-      case 0x7: if ((op & 0xFF) != 0) *fort |= 1u << n; break;           /* add #imm,Rn */
+      case 0x7: if ((op & 0xFF) != 0) *cont |= 1u << n; break;           /* add #imm,Rn */
       case 0x8:
         switch (n) {
-          case 0x8: *vgl |= 1u; break;                                    /* cmp/eq #imm,R0 */
-          case 0x9: case 0xB: case 0xD: case 0xF: *bed = 1; break;        /* bt, bf, bt/s, bf/s */
+          case 0x8: *cmp_op |= 1u; break;                                    /* cmp/eq #imm,R0 */
+          case 0x9: case 0xB: case 0xD: case 0xF: *cond_op = 1; break;        /* bt, bf, bt/s, bf/s */
           default: return 0;  /* mov.X @(d,Rm) etc. */
         }
         break;
-      case 0x9: case 0xD: *neu |= 1u << n; break;  /* PC-relative literals */
-      case 0xE: *neu |= 1u << n; break;                                   /* mov #imm,Rn */
+      case 0x9: case 0xD: *new_val |= 1u << n; break;  /* PC-relative literals */
+      case 0xE: *new_val |= 1u << n; break;                                   /* mov #imm,Rn */
       case 0xA: break;                                                    /* bra */
-      case 0xC: if (n == 0x8) { *vgl |= 1u; break; } return 0;            /* tst #imm,R0 */
+      case 0xC: if (n == 0x8) { *cmp_op |= 1u; break; } return 0;            /* tst #imm,R0 */
       default: return 0;
     }
   }
   return 1;
 }
-static bool RechenZykAb(u32 b1, u32 e1, u32 b2, u32 e2)
+static bool ComputeLoopReject(u32 b1, u32 e1, u32 b2, u32 e2)
 {
-  unsigned vgl = 0, fort = 0, neu = 0; int bed = 0;
-  if (!RechenZykScan(b1, e1, &vgl, &fort, &neu, &bed)) return false;
-  if (b2 != 0 && !RechenZykScan(b2, e2, &vgl, &fort, &neu, &bed)) return false;
-  if (!bed) return false;
-  fort &= ~neu;
-  if ((vgl & fort) == 0) return false;
+  unsigned cmp_op = 0, cont = 0, new_val = 0; int cond_op = 0;
+  if (!ComputeLoopScan(b1, e1, &cmp_op, &cont, &new_val, &cond_op)) return false;
+  if (b2 != 0 && !ComputeLoopScan(b2, e2, &cmp_op, &cont, &new_val, &cond_op)) return false;
+  if (!cond_op) return false;
+  cont &= ~new_val;
+  if ((cmp_op & cont) == 0) return false;
   return true;
 }
-/* Trampoline switch; takes effect in ZykelSpringtNach. */
-static bool Trampolin_an(void) {
-  static int v = -1;
-  /* always enabled */
-  if (v < 0) v = 1;
-  return v != 0;
-}
-static bool ZykelSpringtNach(u32 b_addr, u32 e_addr, u32 ziel)
+static bool CycleJumpsTo(u32 b_addr, u32 e_addr, u32 goal)
 {
   if (e_addr < b_addr) return false;
   for (int k = 0; k < 2; k++) {
@@ -537,12 +454,12 @@ static bool ZykelSpringtNach(u32 b_addr, u32 e_addr, u32 ziel)
             || (op & 0xFF00) == 0x8D00 || (op & 0xFF00) == 0x8F00) { /* bt.s / bf.s */
       disp = (s32)(signed char)(op & 0x00FF);
       /* fall-through path of a non-delayed bt/bf (the block ends exactly here) leads to `bra target ; nop` */
-      if (Trampolin_an() && a == e_addr && ((op & 0xFF00) == 0x8900 || (op & 0xFF00) == 0x8B00)) {
+      if (a == e_addr && ((op & 0xFF00) == 0x8900 || (op & 0xFF00) == 0x8B00)) {
         const u16 t0 = MappedMemoryReadWord(e_addr + 2, NULL);
         const u16 t1 = MappedMemoryReadWord(e_addr + 4, NULL);
         if ((t0 & 0xF000) == 0xA000 && t1 == 0x0009) {
           const s32 td = (t0 & 0x800) ? (s32)((t0 & 0xFFF) | 0xFFFFF000) : (s32)(t0 & 0xFFF);
-          if ((u32)(e_addr + 2 + 4 + (td << 1)) == ziel) {
+          if ((u32)(e_addr + 2 + 4 + (td << 1)) == goal) {
             return true;
           }
         }
@@ -550,26 +467,25 @@ static bool ZykelSpringtNach(u32 b_addr, u32 e_addr, u32 ziel)
     } else {
       continue;
     }
-    if ((u32)(a + 4 + (disp << 1)) == ziel) return true;
+    if ((u32)(a + 4 + (disp << 1)) == goal) return true;
   }
   return false;
 }
 
-static void Chain2Merken(u32 block_b, u32 partner_b, u32 partner_e) {
-  for (unsigned i = 0; i < chain2_anzahl; i++) {
+static void Chain2Remember(u32 block_b, u32 partner_b, u32 partner_e) {
+  for (unsigned i = 0; i < chain2_count; i++) {
     if (chain2_tab[i].block_b == block_b) {
       chain2_tab[i].partner_b = partner_b;
       chain2_tab[i].partner_e = partner_e;
       return;
     }
   }
-  if (chain2_anzahl < CHAIN2_MAX) {
-    chain2_tab[chain2_anzahl].block_b   = block_b;
-    chain2_tab[chain2_anzahl].partner_b = partner_b;
-    chain2_tab[chain2_anzahl].partner_e = partner_e;
-    chain2_anzahl++;
+  if (chain2_count < CHAIN2_MAX) {
+    chain2_tab[chain2_count].block_b   = block_b;
+    chain2_tab[chain2_count].partner_b = partner_b;
+    chain2_tab[chain2_count].partner_e = partner_e;
+    chain2_count++;
   }
-  else INSTR(g_c2_verworfen++);
 }
 
 /* Second chance for loops whose partner block was missing at translation
@@ -578,60 +494,51 @@ static void Chain2Merken(u32 block_b, u32 partner_b, u32 partner_e) {
    the partner is translated moments later. Fix: remember the candidate and
    complete it when the partner is translated. The conditions stay as strict
    as before: both blocks must be free of writes. */
-#define NACHPRUEF_MAX 256
-struct NachpruefEintrag { u32 kandidat_b; u32 ziel; };
-static NachpruefEintrag nachpruef_tab[NACHPRUEF_MAX];
-static unsigned nachpruef_anzahl = 0;
+#define RECHECK_MAX 256
+struct RecheckEntry { u32 candidate_b; u32 goal; };
+static RecheckEntry recheck_tab[RECHECK_MAX];
+static unsigned recheck_count = 0;
 
-static bool NACHPRUEF_enabled() {
-  static int v = -1;
-  if (v < 0) {
-    v = 1; /* always enabled */
+
+static void RecheckQueue(u32 candidate_b, u32 goal) {
+  for (unsigned i = 0; i < recheck_count; i++)
+    if (recheck_tab[i].candidate_b == candidate_b && recheck_tab[i].goal == goal) return;
+  if (recheck_count < RECHECK_MAX) {
+    recheck_tab[recheck_count].candidate_b = candidate_b;
+    recheck_tab[recheck_count].goal       = goal;
+    recheck_count++;
   }
-  return v != 0;
 }
 
-static void NachpruefVormerken(u32 kandidat_b, u32 ziel) {
-  for (unsigned i = 0; i < nachpruef_anzahl; i++)
-    if (nachpruef_tab[i].kandidat_b == kandidat_b && nachpruef_tab[i].ziel == ziel) return;
-  if (nachpruef_anzahl < NACHPRUEF_MAX) {
-    nachpruef_tab[nachpruef_anzahl].kandidat_b = kandidat_b;
-    nachpruef_tab[nachpruef_anzahl].ziel       = ziel;
-    nachpruef_anzahl++;
-  }
-  else INSTR(g_np_verworfen++);
-}
-
-static void NachpruefVergessen(u32 adr) {
+static void RecheckForget(u32 adr) {
   unsigned d = 0;
-  for (unsigned i = 0; i < nachpruef_anzahl; i++)
-    if (nachpruef_tab[i].kandidat_b != adr && nachpruef_tab[i].ziel != adr)
-      nachpruef_tab[d++] = nachpruef_tab[i];
-  nachpruef_anzahl = d;
+  for (unsigned i = 0; i < recheck_count; i++)
+    if (recheck_tab[i].candidate_b != adr && recheck_tab[i].goal != adr)
+      recheck_tab[d++] = recheck_tab[i];
+  recheck_count = d;
 }
 
 /* True if pc lies in the partner range of block block_b. */
-static inline bool Chain2ImBereich(u32 b, u32 e, u32 pc, bool einschliesslich) {
+static inline bool Chain2InRange(u32 b, u32 e, u32 pc, bool inclusive) {
   if (pc < b) return false;
-  return einschliesslich ? (pc <= e) : (pc < e);
+  return inclusive ? (pc <= e) : (pc < e);
 }
 
-static bool Chain2ImPartner(u32 block_b, u32 pc) {
-  if (chain2_anzahl == 0) return false;
+static bool Chain2InPartner(u32 block_b, u32 pc) {
+  if (chain2_count == 0) return false;
   /* partner_e is the address of the partner block's LAST instruction, so the
      range runs up to and including it; `<` would exclude the branch back, on
      which the PC of a wait loop rests. */
-  const bool bis_einschliesslich = RANDFIX2_enabled();
-  unsigned i = chain2_letzter;
-  if (i < chain2_anzahl && chain2_tab[i].block_b == block_b) {
-    return Chain2ImBereich(chain2_tab[i].partner_b, chain2_tab[i].partner_e,
-                           pc, bis_einschliesslich);
+  unsigned i = chain2_last;
+  if (i < chain2_count && chain2_tab[i].block_b == block_b) {
+    return Chain2InRange(chain2_tab[i].partner_b, chain2_tab[i].partner_e,
+                           pc, true);
   }
-  for (i = 0; i < chain2_anzahl; i++) {
+  for (i = 0; i < chain2_count; i++) {
     if (chain2_tab[i].block_b == block_b) {
-      chain2_letzter = i;
-      return Chain2ImBereich(chain2_tab[i].partner_b, chain2_tab[i].partner_e,
-                             pc, bis_einschliesslich);
+      chain2_last = i;
+      return Chain2InRange(chain2_tab[i].partner_b, chain2_tab[i].partner_e,
+                             pc, true);
     }
   }
   return false;
@@ -1169,18 +1076,13 @@ void PageJump(void); // jumps to a different page
 void PageFlip(void); // "flips" the page
 /* Block chaining in assembler: at translation time the exit templates
    epilogue_k/PageFlip_k (same size as epilogue/PageFlip) are used. They jump
-   into kette_stub, which enters the next HWRAM block directly when C would do
+   into chain_stub, which enters the next HWRAM block directly when C would do
    nothing else (no BLOCK_LOOP, no acceptable interrupt, time slice not full,
    target entry present); otherwise the old epilogue returns to C. Only helps
    SH2-bound titles. Always off in the diagnostic build, where per-block
    counters run in C. */
-/* Chaining stage: 0 off, 1 = block exits via epilogue_k/PageFlip_k, 2 = the
-   delayed branch exits (seperator_delay_slot_k/_after_k) also go through
-   kette_stub. */
-static int KetteStufe(void) {
-  return 2;   /* fixed: chaining stage 2 */
-}
-static int KetteAn(void) { return KetteStufe() >= 1; }
+/* Block chaining: the block exits (epilogue_k/PageFlip_k) and the delayed
+   branch exits (seperator_delay_slot_k/_after_k) go through chain_stub. */
 
 #if defined(AARCH64)
 void internal_jmp(void);
@@ -1196,45 +1098,6 @@ const intptr_t internal_delay_jmp_to_offset = 4*4;
  
 extern x86op_desc asm_list[];
 
-}
-
-/* Hot counters: DZ(x) is INSTR(x) (instrument.h) and compiles away unless
-   YABA_INSTRUMENT is set; each counter is cache-line aligned so that master
-   and slave, running on different cores, do not share a line (false sharing). */
-  #define DZ(x) INSTR(x)
-
-extern "C" { alignas(64) unsigned int g_blk_eintritte = 0;
-
-/* Why does a block end? Three counters, updated at translation time (rare
-   after warm-up): branch instruction, LDC SR, or MAXBLOCKSIZE reached. */
-unsigned long long g_abbr_branch = 0;   /* block ended by a branch instruction */
-unsigned long long g_abbr_ldcsr  = 0;   /* LDC SR / LDC.L SR                    */
-unsigned long long g_abbr_size   = 0;   /* MAXBLOCKSIZE reached                 */
-}  /* closes the extern "C" block opened at g_blk_eintritte */
-/* Per-CPU split of the block entry counter. g_blk_eintritte stays the sum
-   (blkm + blks == blk). */
-extern "C" { alignas(64) unsigned int g_blk_m = 0; }
-extern "C" { alignas(64) unsigned int g_blk_s = 0; }  /* own cache line per CPU */
-
-/* Why does the CHAIN2 catch not apply? Master counters: g_c2zs_m (the
-   ZYKSLAVE restriction blocks it), g_c2np_m (Chain2ImPartner says no),
-   g_c2noadj_m (no BLOCK_LOOP_ADJ), with g_c2kand_m (candidates) and g_c2tr_m
-   (hits) as references. Master only, since the ZYKSLAVE restriction only
-   applies there. Must have C linkage. */
-extern "C" {
-  alignas(64) unsigned int g_c2kand_m  = 0;  /* master group, own cache line */
-  unsigned int g_c2zs_m    = 0;
-  unsigned int g_c2np_m    = 0;
-  unsigned int g_c2tr_m    = 0;
-  unsigned int g_c2noadj_m = 0;
-}
-/* The same counters for the slave. g_c2zs_s must stay 0, because the ZYKSLAVE
-   restriction requires !is_slave_. */
-extern "C" {
-  alignas(64) unsigned int g_c2kand_s  = 0;  /* slave group, own cache line */
-  unsigned int g_c2np_s    = 0;
-  unsigned int g_c2tr_s    = 0;
-  unsigned int g_c2noadj_s = 0;
 }
 
 x86op_desc asm_list[] =
@@ -1389,27 +1252,24 @@ x86op_desc asm_list[] =
    entry, leaves setDirty inline before this. */
 __attribute__((noinline))
 void CompileBlocks::setDirtySlow(u32 addr) {
-  bool diag_ = DegenDiagOn(); /* read once per call */
     for (auto it = LookupParentTable[addr].begin(); it != LookupParentTable[addr].end(); it++) {
       if (LookupTable[*it] != NULL) {
         for (u32 i = adress_mask(LookupTable[*it]->b_addr) ; i <= adress_mask(LookupTable[*it]->e_addr); i++ ) {
           if (i != addr) {
             LookupParentTable[i].remove(*it);
-            PraesenzNachRemove(i);
+            PresenceAfterRemove(i);
             /* counts calls, not removed elements (list::remove() returns void
                before C++20); a proxy for the parent table cleanup rate */
-            if (diag_) diag_parent_removed_++;
           }
         }
          LOG("%d %08X is removed", LookupTable[*it]->id, (*it) << 1);
         remove_count_++;
-        if (diag_) diag_invalidations_++;
         self_modify_block[ (((*it) << 1) | 0x06000000) ] = LookupTable[*it]->id;
         LookupTable[*it] = NULL;
       }
     }
   LookupParentTable[addr].clear();
-  PraesenzLoeschen(addr);
+  PresenceClear(addr);
 }
 
 void CompileBlocks::Init()
@@ -1427,7 +1287,7 @@ void CompileBlocks::Init()
   }
   for (int i = 0; i < (0x100000>>1) ; i++) {
     LookupParentTable[i].clear();
-    PraesenzLoeschen(i);
+    PresenceClear(i);
   }
   return;
 }
@@ -1457,24 +1317,20 @@ void CompileBlocks::BuildInstructionList()
 
 Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL, bool is_slave)
 {
-  bool uebhash_reuse_ = false;
+  bool hashreuse_ = false;
   compile_count_++;
   /* read once per compile */
-  bool diag_ = DegenDiagOn();
-  if (diag_) diag_compiles_total_++;
 
   auto block_index = self_modify_block.find(pc);
   if( block_index != self_modify_block.end()  ){
       blockCount = block_index->second ;
       self_modify_block.erase(pc);
-      uebhash_reuse_ = true;
+      hashreuse_ = true;
       LOG( "hit! last_modified_block = %d, last_modified_pc = %08X",blockCount, pc );
-      if (diag_) diag_compiles_reuse_++;
   }else{
     blockCount = LastMakeBlock;
     LastMakeBlock++;
     LastMakeBlock &= (NUMOFBLOCKS-1);
-    if (diag_) diag_compiles_new_++;
   }
 
   /* On the self-modifying path blockCount is the id of the same block, so
@@ -1482,14 +1338,11 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL, bool is_slav
      here would remove nothing. */
   if (g_CompleBlock[blockCount].b_addr != 0x00 &&
       g_CompleBlock[blockCount].b_addr != pc) {
-    if (diag_) diag_evictions_++;
     /* pending candidates for this block expire with it */
-    if (NACHPRUEF_enabled()) {
-      NachpruefVergessen(g_CompleBlock[blockCount].b_addr);
-      /* chain2_tab entries could point into an address range that now holds
-         different code */
-      Chain2VergessenPartner(g_CompleBlock[blockCount].b_addr);
-    }
+    RecheckForget(g_CompleBlock[blockCount].b_addr);
+    /* chain2_tab entries could point into an address range that now holds
+       different code */
+    Chain2ForgetPartner(g_CompleBlock[blockCount].b_addr);
 
     if ((g_CompleBlock[blockCount].b_addr & 0xFF000000) == 0xC0000000) {
       LookupTableC[(g_CompleBlock[blockCount].b_addr & 0x000FFFFF) >> 1] = NULL;
@@ -1520,8 +1373,7 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL, bool is_slav
             /* The lists in LookupParentTable hold word addresses, not ring
                indices, so the entry is removed by address. */
             LookupParentTable[i].remove(old_b);
-            PraesenzNachRemove(i);
-            if (diag_) diag_parent_removed_++;
+            PresenceAfterRemove(i);
           }
         }
         LookupTable[(g_CompleBlock[blockCount].b_addr & 0x000FFFFF) >> 1] = NULL;
@@ -1540,7 +1392,7 @@ Block * CompileBlocks::CompileBlock(u32 pc, addrs * ParentT = NULL, bool is_slav
   if (EmmitCode(&g_CompleBlock[blockCount], ParentT, is_slave) != 0) {
     return NULL;
   }
-  (void)uebhash_reuse_;
+  (void)hashreuse_;
 
   return &g_CompleBlock[blockCount];
 }
@@ -1624,42 +1476,36 @@ void CompileBlocks::opcodePass(x86op_desc *op, u16 opcode, u8 *ptr)
    the block ends right after the store, and the following block is translated
    from the patched memory. No cost in the generated code; a false alarm only
    ends a block earlier. */
-static int SmcEndeAn(void) {
-  return 1;   /* fixed: always on */
-}
-static int SleepEndeAn(void) {
-  return 1;   /* fixed: always on */
-}
-static inline void SmcZielPruefen(u32 t, u32 ia, u32 start, bool &ende) {
+static inline void SmcCheckTarget(u32 t, u32 ia, u32 start, bool &end_pc) {
   const u32 t2 = t & 0xDFFFFFFFu, s2 = start & 0xDFFFFFFFu, i2 = ia & 0xDFFFFFFFu;
-  if (t2 >= s2 && t2 < i2 + 0x200u) ende = true;
+  if (t2 >= s2 && t2 < i2 + 0x200u) end_pc = true;
 }
 /* Tracks known register values of a block (translation time only). ia = address of the instruction. */
-static inline void SmcVerfolge(u16 op, u32 ia, u32 start, u32 *w, u32 &bek, bool &ende, u32 &ziel) {
+static inline void SmcTrack(u16 op, u32 ia, u32 start, u32 *w, u32 &known, bool &end_pc, u32 &goal) {
   const int n = (op >> 8) & 15, m = (op >> 4) & 15;
   const u32 bn = 1u << n, bm = 1u << m;
   switch (op >> 12) {
-  case 0xD: w[n] = MappedMemoryReadLong(((ia + 4) & ~3u) + (u32)(op & 0xFF) * 4, NULL); bek |= bn; return;
-  case 0xE: w[n] = (u32)(s32)(s8)(op & 0xFF); bek |= bn; return;
-  case 0x7: if (bek & bn) w[n] += (u32)(s32)(s8)(op & 0xFF); return;
+  case 0xD: w[n] = MappedMemoryReadLong(((ia + 4) & ~3u) + (u32)(op & 0xFF) * 4, NULL); known |= bn; return;
+  case 0xE: w[n] = (u32)(s32)(s8)(op & 0xFF); known |= bn; return;
+  case 0x7: if (known & bn) w[n] += (u32)(s32)(s8)(op & 0xFF); return;
   case 0x6:
-    if ((op & 15) == 3) { if (bek & bm) { w[n] = w[m]; bek |= bn; } else bek &= ~bn; return; }
-    bek &= ~(bn | bm); return;  /* load/arithmetic instructions; @Rm+ changes Rm */
+    if ((op & 15) == 3) { if (known & bm) { w[n] = w[m]; known |= bn; } else known &= ~bn; return; }
+    known &= ~(bn | bm); return;  /* load/arithmetic instructions; @Rm+ changes Rm */
   case 0x2:
-    if ((op & 15) <= 2) { if (bek & bn) { SmcZielPruefen(w[n], ia, start, ende); if (ende) ziel = w[n]; } return; }
-    bek &= ~bn; return;  /* @-Rn, and/or/xor/xtrct change Rn */
+    if ((op & 15) <= 2) { if (known & bn) { SmcCheckTarget(w[n], ia, start, end_pc); if (end_pc) goal = w[n]; } return; }
+    known &= ~bn; return;  /* @-Rn, and/or/xor/xtrct change Rn */
   case 0x1:                                                     /* mov.l Rm,@(disp,Rn) */
-    if (bek & bn) { const u32 t = w[n] + (u32)(op & 15) * 4; SmcZielPruefen(t, ia, start, ende); if (ende) ziel = t; }
+    if (known & bn) { const u32 t = w[n] + (u32)(op & 15) * 4; SmcCheckTarget(t, ia, start, end_pc); if (end_pc) goal = t; }
     return;
   case 0x8: {
     const int sub = (op >> 8) & 15, rn = (op >> 4) & 15;
     if (sub == 0 || sub == 1) {                                 /* mov.b/w R0,@(disp,Rn) */
-      if (bek & (1u << rn)) { const u32 t = w[rn] + (u32)(op & 15) * (sub + 1); SmcZielPruefen(t, ia, start, ende); if (ende) ziel = t; }
-    } else if (sub == 4 || sub == 5) bek &= ~1u;                /* mov.b/w @(disp,Rn),R0 */
+      if (known & (1u << rn)) { const u32 t = w[rn] + (u32)(op & 15) * (sub + 1); SmcCheckTarget(t, ia, start, end_pc); if (end_pc) goal = t; }
+    } else if (sub == 4 || sub == 5) known &= ~1u;                /* mov.b/w @(disp,Rn),R0 */
     return; }
-  case 0x3: case 0x4: case 0x5: case 0x9: bek &= ~bn; return;
-  case 0xC: bek &= ~1u; return;
-  default: bek = 0; return;  /* anything else: nothing is known any more */
+  case 0x3: case 0x4: case 0x5: case 0x9: known &= ~bn; return;
+  case 0xC: known &= ~1u; return;
+  default: known = 0; return;  /* anything else: nothing is known any more */
   }
 }
 
@@ -1672,9 +1518,8 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
   u8 *ptr, *startptr;
   u32 instruction_counter = 0;
   u32 write_memory_counter = 0;
-  /* tracking of stores into the block's own code, see SmcVerfolge */
-  const int smc_an = SmcEndeAn();
-  u32 smc_wert[16]; u32 smc_bekannt = 0; bool smc_ende = false; u32 smc_ziel = 0;
+  /* tracking of stores into the block's own code, see SmcTrack */
+  u32 smc_value[16]; u32 smc_known = 0; bool smc_end = false; u32 smc_target = 0;
   u32 calsize;
   /* The address map is static and reused: clear() keeps the buckets, so
      nothing is allocated per translation. CompileBlock only runs on the
@@ -1712,7 +1557,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
     nomal_seperator = (void*)seperator_normal;
     nomal_seperator_size = SEPERATORSIZE_NORMAL;
     nomal_seperator_counter_offset = NORMAL_CLOCK_OFFSET;
-    delay_seperator = (KetteStufe() >= 2) ? (void*)seperator_delay_slot_k : (void*)seperator_delay_slot;
+    delay_seperator = (void*)seperator_delay_slot_k;
     delay_seperator_size = SEPERATORSIZE_DELAY_SLOT;
     delayslot_seperator_counter_offset = DALAY_CLOCK_OFFSET;
   }
@@ -1742,8 +1587,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
       }
       if (!already_present) {
         ParentT[keepaddr].push_back(parent_val);
-        PraesenzSetzen(keepaddr);
-        if (DegenDiagOn()) diag_parent_pushes_++;
+        PresenceSet(keepaddr);
       }
     }
 #endif
@@ -1781,7 +1625,6 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
     }
 #endif
     if (calsize >= MAXBLOCKSIZE) {
-      INSTR(g_abbr_size++);
       break; // no space is available
     }
 
@@ -1813,7 +1656,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
     instruction_counter++;
     asm_list[i].build_count++;
     write_memory_counter += OPFIX_write(op, asm_list[i].write_count);
-    if (smc_an) SmcVerfolge(op, addr - 2, start_addr, smc_wert, smc_bekannt, smc_ende, smc_ziel);
+    SmcTrack(op, addr - 2, start_addr, smc_value, smc_known, smc_end, smc_target);
 
     u32 jumppc = 0xFFFFFFFF;
     uintptr_t jumpptr = 0xFFFFFFFF;
@@ -1825,16 +1668,13 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
         temp = (op & 0xfff) << 1;
         if (temp & 0x1000)
           temp |= 0xfffff000;
-        if (BRAFIX_enabled()) {
-          /* The sign extension above has no effect because temp is only 16 bits
-             wide (the same variable then receives the delay-slot instruction),
-             so a separate 32-bit value is used here. */
-          s32 bra_disp = (op & 0x800) ? (s32)((op & 0xfff) | 0xfffff000)
-                                      : (s32)(op & 0xfff);
-          jumppc = addr + (u32)(bra_disp << 1) + 2;
-        } else {
-          jumppc = addr + ((signed)(op & 0xfff) << 1) + 2;
-        }
+        /* bra/bsr: temp is only 16 bits wide (it then receives the delay-slot
+           instruction), so the sign-extended 32-bit displacement is computed
+           here; otherwise a backward bra looks like a forward jump to the
+           idle-loop detection. */
+        s32 bra_disp = (op & 0x800) ? (s32)((op & 0xfff) | 0xfffff000)
+                                    : (s32)(op & 0xfff);
+        jumppc = addr + (u32)(bra_disp << 1) + 2;
       }
       else if (asm_list[i].delay == 3) {
         jumppc = addr + ((signed char)(op & 0xff) << 1) + 2;
@@ -1903,7 +1743,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
         continue;
       }
       else {
-        memcpy((void*)(ptr + *(asm_list[i].size) + nomal_seperator_size), (KetteAn() && !debug_mode_) ? (void*)PageFlip_k : (void*)PageFlip, DELAYJUMPSIZE);
+        memcpy((void*)(ptr + *(asm_list[i].size) + nomal_seperator_size), !debug_mode_ ? (void*)PageFlip_k : (void*)PageFlip, DELAYJUMPSIZE);
         count++;
         opcodePass(&asm_list[i], op, ptr);
 #if defined(AARCH64)
@@ -1940,8 +1780,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
         }
         if (!already_present) {
           ParentT[keepaddr].push_back(parent_val);
-          PraesenzSetzen(keepaddr);
-          if (DegenDiagOn()) diag_parent_pushes_++;
+          PresenceSet(keepaddr);
         }
       }
 #endif
@@ -1998,7 +1837,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
         continue;
       }
       else {
-        memcpy((void*)(ptr + offset), (KetteStufe() >= 2 && !debug_mode_) ? (void*)seperator_delay_after_k : (void*)seperator_delay_after, SEPERATORSIZE_DELAY_AFTER);
+        memcpy((void*)(ptr + offset), !debug_mode_ ? (void*)seperator_delay_after_k : (void*)seperator_delay_after, SEPERATORSIZE_DELAY_AFTER);
         count++;
         opcodePass(&asm_list[j], temp, ptr);
 #if defined(AARCH64)
@@ -2018,10 +1857,8 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
       // jump to inside and no write is happend
       if (jumppc >= start_addr &&  jumppc < addr ) {
         if (write_memory_counter == 0
-            && !(WANDERFIX_stufe()
-                 && (SchleifeWandert(page->b_addr, addr - 2)
-                     ? (INSTR(++g_wanderfix_abgelehnt), true) : false))
-            && !(RECHENZYK_an() && RechenZykAb(page->b_addr, addr - 2, 0, 0))) {
+            && !LoopAddressWanders(page->b_addr, addr - 2)
+            && !ComputeLoopReject(page->b_addr, addr - 2, 0, 0)) {
           page->flags |= BLOCK_LOOP;
 #ifdef BUILD_INFO 
               LOG("InfinityLoop block %08X 0x%04X  from 0x%08X to 0x%08X\n", start_addr, op, addr - 2, jumppc);
@@ -2041,24 +1878,22 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
         }
         /* Partner not translated yet: remember the candidate instead of
            dropping it. It has already been checked to be write-free. */
-        if (tmp == NULL && NACHPRUEF_enabled()) {
-          NachpruefVormerken(page->b_addr, jumppc);
+        if (tmp == NULL) {
+          RecheckQueue(page->b_addr, jumppc);
         }
-        const bool adj_luecklos = (tmp != NULL) && ((tmp->e_addr+2) == page->b_addr);
+        const bool adj_gapless = (tmp != NULL) && ((tmp->e_addr+2) == page->b_addr);
         /* Same cycle, but jumped over a gap. Only if tmp is write-free, so the
            strictness of the normal path is kept. */
-        bool zykel_geschlossen = false;
-        if (ZYKEL2_enabled() && tmp != NULL && !adj_luecklos
+        bool cycle_closed = false;
+        if (tmp != NULL && !adj_gapless
             && (tmp->flags & BLOCK_WRITE) == 0) {
-          zykel_geschlossen = ZykelSpringtNach(tmp->b_addr, tmp->e_addr, page->b_addr);
+          cycle_closed = CycleJumpsTo(tmp->b_addr, tmp->e_addr, page->b_addr);
         }
         if (tmp != NULL && (tmp->flags&BLOCK_WRITE) == 0
-            && (adj_luecklos || zykel_geschlossen)
-            && !(WANDERFIX_stufe()
-                 && ((SchleifeWandert(page->b_addr, addr - 2)
-                   || SchleifeWandert(tmp->b_addr, tmp->e_addr))
-                     ? (INSTR(++g_wanderfix_abgelehnt), true) : false))
-            && !(RECHENZYK_an() && RechenZykAb(page->b_addr, addr - 2, tmp->b_addr, tmp->e_addr))) {
+            && (adj_gapless || cycle_closed)
+            && !(LoopAddressWanders(page->b_addr, addr - 2)
+                 || LoopAddressWanders(tmp->b_addr, tmp->e_addr))
+            && !ComputeLoopReject(page->b_addr, addr - 2, tmp->b_addr, tmp->e_addr)) {
           page->flags |= BLOCK_LOOP;
           // Flag the two-block adjacency case. BLOCK_LOOP_ADJ is the hard
           // condition for the adjacent-block idle detection in Execute(); it
@@ -2068,10 +1903,10 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
           // back) -> tmp -> (contiguous) -> page, so after page has run the PC
           // lies in the partner, not in the block itself. Both blocks have been
           // checked to be free of writes at this point.
-          /* only the cycle case gets its own bit; adj_luecklos (fall-through)
+          /* only the cycle case gets its own bit; adj_gapless (fall-through)
              is unaffected */
-          if (!adj_luecklos && zykel_geschlossen) page->flags |= BLOCK_LOOP_ZYK;
-          Chain2Merken(page->b_addr, tmp->b_addr, tmp->e_addr);
+          if (!adj_gapless && cycle_closed) page->flags |= BLOCK_LOOP_CYC;
+          Chain2Remember(page->b_addr, tmp->b_addr, tmp->e_addr);
         }
 
       }
@@ -2082,22 +1917,21 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
          BT/BF instead of ending the block. That would need the PageFlip
          fall-through path in dynalib_arm64.s to check the time-slice end,
          which it does not do. */
-      INSTR(g_abbr_branch++);
       break;
     }
 
-    if (op == 0x001B && SleepEndeAn()) {  /* the block ends after SLEEP, the PC stays on SLEEP */
+    if (op == 0x001B) {  /* the block ends after SLEEP, the PC stays on SLEEP */
       break;
     }
 
     if ( (op & 0xF0FF) == 0x400e || (op & 0xF0FF) == 0x4007) // sh2_LDC_SR
     {
-      INSTR(g_abbr_ldcsr++);   /* unavoidable: SR changes the interrupt mask, so the block must end here */
+      /* unavoidable: SR changes the interrupt mask, so the block must end here */
       break;
     }
 
     /* A store into the block's own code ends the block right after it. */
-    if (smc_ende) {
+    if (smc_end) {
       break;
     }
 
@@ -2107,7 +1941,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
      rare once warmed up): blk_befehle = mean block size in SH2 instructions,
      blk_mem = share of memory-access instructions. */
   /* Extent and flags of the finished block. */
-  memcpy((void*)ptr, (KetteAn() && !debug_mode_) ? (void*)epilogue_k : (void*)epilogue, EPILOGSIZE);
+  memcpy((void*)ptr, !debug_mode_ ? (void*)epilogue_k : (void*)epilogue, EPILOGSIZE);
   ptr += EPILOGSIZE;
 
 
@@ -2119,50 +1953,48 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
   /* This block was just completed. If it was the missing partner of an
      earlier rejected candidate, the cycle is accepted now. The check is as
      strict as in the normal path: both blocks must be free of writes. */
-  if (NACHPRUEF_enabled() && (page->flags & BLOCK_WRITE) == 0) {
+  if ((page->flags & BLOCK_WRITE) == 0) {
     unsigned d = 0;
-    for (unsigned i = 0; i < nachpruef_anzahl; i++) {
-      bool erledigt = false;
-      if (nachpruef_tab[i].ziel == page->b_addr) {
-        const u32 kb = nachpruef_tab[i].kandidat_b;
-        Block * kand = NULL;
-        if ((kb & 0x0FF00000) == 0x06000000)      kand = LookupTable[(kb & 0x000FFFFF) >> 1];
-        else if ((kb & 0x0FF00000) == 0x00200000) kand = LookupTableLow[(kb & 0x000FFFFF) >> 1];
-        else if ((kb & 0x0FF00000) == 0x00000000) kand = LookupTableRom[(kb & 0x000FFFFF) >> 1];
+    for (unsigned i = 0; i < recheck_count; i++) {
+      bool done_flag = false;
+      if (recheck_tab[i].goal == page->b_addr) {
+        const u32 kb = recheck_tab[i].candidate_b;
+        Block * cand = NULL;
+        if ((kb & 0x0FF00000) == 0x06000000)      cand = LookupTable[(kb & 0x000FFFFF) >> 1];
+        else if ((kb & 0x0FF00000) == 0x00200000) cand = LookupTableLow[(kb & 0x000FFFFF) >> 1];
+        else if ((kb & 0x0FF00000) == 0x00000000) cand = LookupTableRom[(kb & 0x000FFFFF) >> 1];
         /* Same conditions as in the normal path, not just write freedom of
            both blocks. */
-        const bool nach_adj = (kand != NULL) && ((page->e_addr + 2) == kand->b_addr);
+        const bool after_adj = (cand != NULL) && ((page->e_addr + 2) == cand->b_addr);
         /* The late check needs the cycle condition as well: `page` is the
-           just completed partner and `kand` the candidate; kand branches back
-           to page, and page must branch to kand. */
-        bool nach_zykel = false;
-        if (ZYKEL2_enabled() && kand != NULL && !nach_adj
-            && (kand->flags & BLOCK_WRITE) == 0) {
-          nach_zykel = ZykelSpringtNach(page->b_addr, page->e_addr, kand->b_addr);
+           just completed partner and `cand` the candidate; cand branches back
+           to page, and page must branch to cand. */
+        bool after_cycle = false;
+        if (cand != NULL && !after_adj
+            && (cand->flags & BLOCK_WRITE) == 0) {
+          after_cycle = CycleJumpsTo(page->b_addr, page->e_addr, cand->b_addr);
         }
-        if (kand != NULL && kand->b_addr == kb && (kand->flags & BLOCK_WRITE) == 0
-            && (nach_adj || nach_zykel)
+        if (cand != NULL && cand->b_addr == kb && (cand->flags & BLOCK_WRITE) == 0
+            && (after_adj || after_cycle)
             /* Same rejection as in the normal path, otherwise the second chance
                would re-accept what the first one rejected. */
-            && !(WANDERFIX_stufe()
-                 && ((SchleifeWandert(kand->b_addr, kand->e_addr)
-                   || SchleifeWandert(page->b_addr, page->e_addr))
-                     ? (INSTR(++g_wanderfix_abgelehnt), true) : false))
-            && !(RECHENZYK_an() && RechenZykAb(kand->b_addr, kand->e_addr, page->b_addr, page->e_addr))) {
-          kand->flags |= BLOCK_LOOP;
+            && !(LoopAddressWanders(cand->b_addr, cand->e_addr)
+                 || LoopAddressWanders(page->b_addr, page->e_addr))
+            && !ComputeLoopReject(cand->b_addr, cand->e_addr, page->b_addr, page->e_addr)) {
+          cand->flags |= BLOCK_LOOP;
           /* BLOCK_LOOP_ADJ is required: the runtime path checks exactly this
              bit, so without it the late-accepted cycle would never take
              effect. */
-          kand->flags |= BLOCK_LOOP_ADJ;
+          cand->flags |= BLOCK_LOOP_ADJ;
           /* same for the late-accepted case */
-          if (!nach_adj && nach_zykel) kand->flags |= BLOCK_LOOP_ZYK;
-          Chain2MerkenNurNeu(kand->b_addr, page->b_addr, page->e_addr);
-          erledigt = true;
+          if (!after_adj && after_cycle) cand->flags |= BLOCK_LOOP_CYC;
+          Chain2RememberNewOnly(cand->b_addr, page->b_addr, page->e_addr);
+          done_flag = true;
         }
       }
-      if (!erledigt) nachpruef_tab[d++] = nachpruef_tab[i];
+      if (!done_flag) recheck_tab[d++] = recheck_tab[i];
     }
-    nachpruef_anzahl = d;
+    recheck_count = d;
   }
 
 #ifdef BUILD_INFO 
@@ -2196,52 +2028,25 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
 
 DynarecSh2::DynarecSh2() {
   m_pDynaSh2     = new tagSH2;
-  m_pDynaSh2->getmembyte = (uintptr_t)memGetByte;
-  m_pDynaSh2->getmemword = (uintptr_t)memGetWord;
-  /* Fast memory routines (assembler leaf functions in dynalib_arm64.s) serve
-     HWRAM 0x06xxxxxx without a C call and tail-jump to the C functions for
-     everything else, so results are identical. One stage variable controls
-     both reads and writes. */
-  const int mf = 5;   /* fixed: read fast paths up to stage 5 */
-  {
-    m_pDynaSh2->getmemlong = mf ? (uintptr_t)memGetLongFast : (uintptr_t)memGetLong;
-    /* stage 2: also word and byte reads */
-    if (mf >= 2) {
-      m_pDynaSh2->getmemword = (uintptr_t)memGetWordFast;
-      m_pDynaSh2->getmembyte = (uintptr_t)memGetByteFast;
-    }
-    /* stage 4: also low work RAM reads (0x002); stage 5: also on-chip register
-       reads via tail-jump to OnchipRead* (only when the fast I/O path is
-       enabled, otherwise stage 4). */
-    if (mf >= 4) {
-      const int oc = (mf >= 5) && MemFastIoFastAn();
-      m_pDynaSh2->getmemlong = oc ? (uintptr_t)memGetLongFast5 : (uintptr_t)memGetLongFast4;
-      m_pDynaSh2->getmemword = oc ? (uintptr_t)memGetWordFast5 : (uintptr_t)memGetWordFast4;
-      m_pDynaSh2->getmembyte = oc ? (uintptr_t)memGetByteFast5 : (uintptr_t)memGetByteFast4;
-    }
-  }
-  m_pDynaSh2->setmembyte = (uintptr_t)memSetByte;
-  m_pDynaSh2->setmemword = (uintptr_t)memSetWord;
-  m_pDynaSh2->setmemlong = (uintptr_t)memSetLong;
-  /* Stage 3: HWRAM writes with a presence-bit check (dynalib_arm64.s). If the
-     bits are clear, setDirty would return immediately, so the store is done
-     directly; otherwise the C function runs (invalidation). Placed after the
-     default assignments above. */
-  {
-    if (mf >= 3) {
-      m_pDynaSh2->setmemlong = (uintptr_t)memSetLongFast;
-      m_pDynaSh2->setmemword = (uintptr_t)memSetWordFast;
-      m_pDynaSh2->setmembyte = (uintptr_t)memSetByteFast;
-    }
-  }
+  /* Fast memory routines (assembler leaf functions in dynalib_arm64.s): reads
+     of HWRAM, low work RAM and on-chip registers without a C call, everything
+     else tail-jumps to the C functions, so results are identical. HWRAM writes
+     check the presence bits: if they are clear the store is done directly,
+     otherwise the C function runs (invalidation). */
+  m_pDynaSh2->getmembyte = (uintptr_t)memGetByteFast5;
+  m_pDynaSh2->getmemword = (uintptr_t)memGetWordFast5;
+  m_pDynaSh2->getmemlong = (uintptr_t)memGetLongFast5;
+  m_pDynaSh2->setmembyte = (uintptr_t)memSetByteFast;
+  m_pDynaSh2->setmemword = (uintptr_t)memSetWordFast;
+  m_pDynaSh2->setmemlong = (uintptr_t)memSetLongFast;
   m_pDynaSh2->eachclock = (uintptr_t)DebugEachClock;
   /* The work RAM pointers may not exist yet here (the constructor can run
      before memory is allocated), so they are also refreshed on every block
      translation, see CompileBlock. */
-  /* The inlinemem_an field is unused but kept: it keeps hiwram_base and
+  /* The inlinemem_on field is unused but kept: it keeps hiwram_base and
      lowram_base 8-byte aligned, and their offsets are hard-coded in the
      assembler. */
-  m_pDynaSh2->inlinemem_an = 0u;
+  m_pDynaSh2->inlinemem_on = 0u;
   m_pDynaSh2->hiwram_base = (uintptr_t)HighWram;
   m_pDynaSh2->lowram_base = (uintptr_t)LowWram;
 
@@ -2309,7 +2114,7 @@ void DynarecSh2::ExecuteCount( u32 Count ) {
 #endif
 
   m_pDynaSh2->exitcount = targetcnt;
-  zs_erste_scheibe_ = 0;  /* new time slice: clear the marker */
+  fs_first_block_ = 0;  /* new time slice: clear the marker */
 
   //if ((GET_SR() & 0xF0) < GET_ICOUNT()) {
   //  this->CheckInterupt();
@@ -2365,7 +2170,7 @@ void DynarecSh2::Undecoded(){
   // Jump to Exception service routine
   u32 newpc = memGetLong(GET_VBR() + (vectnum << 2));
 
-  /* Note that vector 4 is always used here, although the SH-2 specification
+  /* Vector 4 is always used here, although the SH-2 specification
      calls for vector 6 on a delay-slot failure. */
 
   SET_PC(newpc);
@@ -2379,9 +2184,6 @@ __attribute__((always_inline)) inline int DynarecSh2::Execute(){
 
   Block * pBlock = NULL;
 
-  /* Block entry counters (total and per CPU); compiled out in NODIAG builds. */
-  { extern unsigned int g_blk_eintritte; DZ(g_blk_eintritte++);
-    DZ(is_slave_ ? g_blk_s++ : g_blk_m++); }
 #if defined(EXECUTE_STAT)
   m_pCompiler->setShowCode( is_slave_ );
 #endif
@@ -2538,13 +2340,12 @@ __attribute__((always_inline)) inline int DynarecSh2::Execute(){
     // instead detected when the PC lies in the partner block of the cycle,
     // whose range was recorded at translation time. Not extended to more than
     // two blocks.
-    /* ZYKEL2 blocks are only skipped on the slave. On the slave the CPU is
+    /* CYCLE2 blocks are only skipped on the slave. On the slave the CPU is
        waiting anyway, so skipping gains time. On the master it is doing real
        work, and skipping only delays that work, which then returns in a burst.
-       Only BLOCK_LOOP_ZYK is restricted; the adjacency case stays active on
+       Only BLOCK_LOOP_CYC is restricted; the adjacency case stays active on
        both CPUs. */
-    if (!in_block && CHAIN2_enabled() && (pBlock->flags & BLOCK_LOOP_ADJ)) {
-      DZ(is_slave_ ? g_c2kand_s++ : g_c2kand_m++);
+    if (!in_block && (pBlock->flags & BLOCK_LOOP_ADJ)) {
       /* Only block at the first lock-out per time slice. A hit ends the time
          slice (SET_COUNT(targetcnt) makes the loop condition false), so there
          is at most one per slice. A lock-out does not change SysReg[4], so
@@ -2553,25 +2354,20 @@ __attribute__((always_inline)) inline int DynarecSh2::Execute(){
          is only spinning, and skipping then ends idle time instead of delaying
          work. A pass-through block is normally locked out only the first
          time, so it is unaffected. */
-      if ((pBlock->flags & BLOCK_LOOP_ZYK) && ZYKSLAVE_enabled() && !is_slave_
-          && !(ZSERST_enabled() && zs_erste_scheibe_ == pBlock->b_addr)) {
-        DZ(g_c2zs_m++);  /* blocked by the slave-only rule */
-        if (ZSERST_enabled() && zs_erste_scheibe_ == 0) {
-          zs_erste_scheibe_ = pBlock->b_addr;
+      if ((pBlock->flags & BLOCK_LOOP_CYC) && !is_slave_
+          && !(g_firstslice_adapt_on && fs_first_block_ == pBlock->b_addr)) {
+        /* blocked by the slave-only rule */
+        if (g_firstslice_adapt_on && fs_first_block_ == 0) {
+          fs_first_block_ = pBlock->b_addr;
         }
-      } else if (Chain2ImPartner(pBlock->b_addr, m_pDynaSh2->SysReg[3])) {
+      } else if (Chain2InPartner(pBlock->b_addr, m_pDynaSh2->SysReg[3])) {
         in_block = true;
-        DZ(is_slave_ ? g_c2tr_s++ : g_c2tr_m++);
-      } else {
-        DZ(is_slave_ ? g_c2np_s++ : g_c2np_m++);  /* partner range does not match */
       }
-    } else if (!in_block && CHAIN2_enabled()) {
-      DZ(is_slave_ ? g_c2noadj_s++ : g_c2noadj_m++);
     }
     if (in_block) {
       /* The only real idle-loop skip. loopskip_cnt_ also counts several
          BIOS/undecoded returns, so this is the counter to use for skips. */
-      if (is_slave_) INSTR(g_ls46_s++); else g_ls46_m++;   /* g_ls46_m feeds the ZSERST adaptation */
+      if (!is_slave_) g_ls46_m++;   /* feeds the adaptive first-slice rule (vdp2.cpp) */
       return IN_INFINITY_LOOP;
     } else {
       return 0;
@@ -2664,7 +2460,7 @@ int DynarecSh2::InterruptRutine(u8 Vector, u8 level)
 
     m_pDynaSh2->GenReg[15] -= 4;
     MappedMemoryWriteLong(m_pDynaSh2->GenReg[15], m_pDynaSh2->CtrlReg[0],NULL);
-    if (SleepEndeAn() && memGetWord(m_pDynaSh2->SysReg[3]) == 0x001B) {  /* an accepted IRQ wakes the CPU from SLEEP */
+    if (memGetWord(m_pDynaSh2->SysReg[3]) == 0x001B) {  /* an accepted IRQ wakes the CPU from SLEEP */
       m_pDynaSh2->SysReg[3] += 2;
     }
     m_pDynaSh2->GenReg[15] -= 4;

@@ -127,11 +127,11 @@ extern u8 * Vdp1Ram;
 /* Pointer from which the render thread reads the command list (snapshot of Vdp1Ram). */
 extern u8 * Vdp1RamRender;
 /* Geometry-relevant registers taken from the snapshot. If snapshotting is off,
-   Vdp1RenderRegsGueltig stays 0 and the render path reads the live registers. */
-extern int Vdp1RenderRegsGueltig;
+   Vdp1RenderRegsValid stays 0 and the render path reads the live registers. */
+extern int Vdp1RenderRegsValid;
 extern u16 Vdp1RenderTVMR;
 extern u16 Vdp1RenderFBCR;
-void Vdp1RamSnapAllesNeu(void);
+void Vdp1RamSnapAllNew(void);
 
 // Texture cache persistence: write stamps for VDP1 VRAM. v1_page_seq holds one
 // monotonic stamp per 4 KiB page (512 KiB / 4 KiB = 128), set on every VRAM write.

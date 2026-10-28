@@ -160,7 +160,7 @@ int use_new_scsp = 0;
 /* 1 = SCSP DSP off (no reverb, runs cooler), 0 = DSP on. Set at startup by main.cpp (per-game config key
    `sound dsp`); the menu toggles it live. With the DSP off, DSP-only slots (DISDL 0, IMXL > 0, e.g. Grandia
    music) are output dry at the IMXL level so nothing goes silent. */
-int g_scsp_dspaus = 1;
+int g_scsp_dsp_off = 1;
 int new_scsp_outbuf_pos = 0;
 s32 new_scsp_outbuf_l[900] = { 0 };
 s32 new_scsp_outbuf_r[900] = { 0 };
@@ -492,21 +492,16 @@ void fill_alfo_tables()
 
 /* The new core reads each sample without interpolation (op3); other emulators interpolate linearly.
    Selects linear interpolation; set once in new_scsp_reset (hot path: one int compare per slot and sample). */
-static int s_interp_neu = 0;
+static int s_interp_new = 0;
 /* FM stack selection with bit 5 and the MDL<5 gate. */
-static int s_fmstapel = 0;
+static int s_fmstack = 0;
 /* PLFO depth formula. */
-static int s_plfoneu = 0;
+static int s_plfo_new = 0;
 static s32 s_interp_next[32];
 /* SSCTL (noise/zero) and SBCTL (bit XOR) in the new core; noise slots otherwise played PCM from SA.
    17-bit LFSR, clocked per slot step. */
 /* Sound-direct slots: the hardware bypasses EG/TL/LFO (needed e.g. by Darius Gaiden music and sfx). */
-static int s_sdirfix = 1;
-static int SdirFixAn(void)
-{
-   return s_sdirfix;
-}
-static int s_ssctl_neu = 0;
+static int s_ssctl_new = 0;
 static u32 s_lfsr = 1;
 static const u16 s_sbxor[4] = { 0x0000, 0x7FFF, 0x8000, 0xFFFF };
 
@@ -540,7 +535,7 @@ void op1(struct Slot * slot)
    else if (slot->regs.plfows == 3)
       plfo_val = plfo.noise_table[slot->state.lfo_pos];
 
-   if (s_plfoneu)   /* PLFO depth: ((0x40^(FNS>>4)) * (s8 lfo >> (7-PLFOS))) >> 6, applied to FNS before the octave */
+   if (s_plfo_new)   /* PLFO depth: ((0x40^(FNS>>4)) * (s8 lfo >> (7-PLFOS))) >> 6, applied to FNS before the octave */
    {
       s32 pl = 0;
       if (slot->regs.plfos)
@@ -574,11 +569,11 @@ void op2(struct Slot * slot, struct Scsp * s)
    if (slot->state.attenuation >= 0x3bf)
       return;
 
-   if (slot->regs.mdl && (!s_fmstapel || slot->regs.mdl >= 5))   /* MDL 1-4 does not modulate */
+   if (slot->regs.mdl && (!s_fmstack || slot->regs.mdl >= 5))   /* MDL 1-4 does not modulate */
    {
       //averaging operation
-      u32 x_sel = get_slot(slot, slot->regs.mdxsl) + ((s_fmstapel && (slot->regs.mdxsl & 0x20)) ? 32 : 0);
-      u32 y_sel = get_slot(slot, slot->regs.mdysl) + ((s_fmstapel && (slot->regs.mdysl & 0x20)) ? 32 : 0);
+      u32 x_sel = get_slot(slot, slot->regs.mdxsl) + ((s_fmstack && (slot->regs.mdxsl & 0x20)) ? 32 : 0);
+      u32 y_sel = get_slot(slot, slot->regs.mdysl) + ((s_fmstack && (slot->regs.mdysl & 0x20)) ? 32 : 0);
       s16 xd = s->sound_stack[x_sel];
       s16 yd = s->sound_stack[y_sel];
 
@@ -659,7 +654,7 @@ void op2(struct Slot * slot, struct Scsp * s)
    else
       slot->state.address_pointer = (s32)slot->regs.sa + (slot->state.sample_offset + md_out);
 
-   if (s_interp_neu)   /* address of the next sample (with loop wrap) for interpolation */
+   if (s_interp_new)   /* address of the next sample (with loop wrap) for interpolation */
    {
       s32 nx;
       if (slot->state.backwards)
@@ -678,9 +673,9 @@ void op2(struct Slot * slot, struct Scsp * s)
 void op3(struct Slot * slot)
 {
    u32 addr = (slot->state.address_pointer) & 0x7FFFF;
-   u32 lfsr_alt = s_lfsr;
+   u32 lfsr_old = s_lfsr;
 
-   if (s_ssctl_neu)   /* LFSR clocked per slot step */
+   if (s_ssctl_new)   /* LFSR clocked per slot step */
       s_lfsr = (s_lfsr >> 1) | ((((s_lfsr >> 5) ^ s_lfsr) & 1) << 16);
 
    if (slot->state.attenuation >= 0x3bf)
@@ -691,7 +686,7 @@ void op3(struct Slot * slot)
    else
      slot->state.wave = T2ReadByte(SoundRam, addr) << 8; //SoundRamReadByte(addr) << 8;
 
-   if (s_interp_neu)   /* linear interpolation with a 6-bit fraction */
+   if (s_interp_new)   /* linear interpolation with a 6-bit fraction */
    {
       u32 a2 = (u32)s_interp_next[slot->state.num & 31] & 0x7FFFF;
       s32 s0 = (s16)slot->state.wave, s1;
@@ -700,9 +695,9 @@ void op3(struct Slot * slot)
       slot->state.wave = (u16)(s16)((s0 * (0x40 - (s32)f) + s1 * (s32)f) >> 6);
    }
 
-   if (s_ssctl_neu)   /* sound source select and bit XOR */
+   if (s_ssctl_new)   /* sound source select and bit XOR */
    {
-      if (slot->regs.ssctl == 1)      slot->state.wave = (u16)(lfsr_alt << 8);
+      if (slot->regs.ssctl == 1)      slot->state.wave = (u16)(lfsr_old << 8);
       else if (slot->regs.ssctl >= 2) slot->state.wave = 0;
       slot->state.wave ^= s_sbxor[slot->regs.sbctl & 3];
    }
@@ -878,7 +873,7 @@ void op5(struct Slot * slot)
       else if (slot->regs.alfows == 3)
          alfo_val = alfo.noise_table[slot->state.lfo_pos];
 
-      if (slot->regs.sd && SdirFixAn())   /* sound direct: bypasses EG/TL/LFO */
+      if (slot->regs.sd)   /* sound direct: bypasses EG/TL/LFO */
          sample = slot->state.output;
       else {
       lfo_add = (((alfo_val + 1)) >> (7 - slot->regs.alfos)) << 1;
@@ -1531,9 +1526,9 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
    s32 outr32 = 0;
    s32 cdl32 = 0, cdr32 = 0;   /* CD inputs (slots 16/17) summed separately */
 
-   static int dw_aus = -1, dw_vor = 0;
-   if (dw_aus < 0) {
-     dw_aus = g_scsp_dspaus;
+   static int dw_off = -1, dw_prev = 0;
+   if (dw_off < 0) {
+     dw_off = g_scsp_dsp_off;
    }
 
    //run 32 steps to generate 1 full sample (512 clock cycles at 22579200hz)
@@ -1560,7 +1555,7 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
       if (!debug_muted)
       {
          int disdl = get_sdl_shift(s->slots[last_step].regs.disdl);
-         if (g_scsp_dspaus && s->slots[last_step].regs.disdl == 0 && s->slots[last_step].regs.imxl != 0)
+         if (g_scsp_dsp_off && s->slots[last_step].regs.disdl == 0 && s->slots[last_step].regs.imxl != 0)
             disdl = get_sdl_shift(s->slots[last_step].regs.imxl);   /* DSP-only slot: output dry */
 
          s16 disdl_applied = (s->slots[last_step].state.output >> disdl);
@@ -1595,10 +1590,10 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
 	   scsp_dsp.updated = 0;
    }
 
-   dw_aus = g_scsp_dspaus;   /* live from the menu */
-   if (dw_aus && !dw_vor) memset(scsp_dsp.efreg, 0, sizeof(scsp_dsp.efreg));   /* no stale DSP outputs after switching off */
-   dw_vor = dw_aus;
-   if (!dw_aus)
+   dw_off = g_scsp_dsp_off;   /* live from the menu */
+   if (dw_off && !dw_prev) memset(scsp_dsp.efreg, 0, sizeof(scsp_dsp.efreg));   /* no stale DSP outputs after switching off */
+   dw_prev = dw_off;
+   if (!dw_off)
       ScspDspRunSample(&scsp_dsp, scsp_dsp.last_step, SoundRam);
 
    if (!scsp_dsp.mdec_ct){
@@ -1687,17 +1682,17 @@ void new_scsp_reset(struct Scsp* s)
    }
 
    {
-      s_interp_neu = 1;
+      s_interp_new = 1;
       memset(s_interp_next, 0, sizeof(s_interp_next));
    }
    {
-      s_plfoneu = 1;
+      s_plfo_new = 1;
    }
    {
-      s_fmstapel = 1;
+      s_fmstack = 1;
    }
    {
-      s_ssctl_neu = 1; s_lfsr = 1; 
+      s_ssctl_new = 1; s_lfsr = 1; 
    }
 
    fill_plfo_tables();
@@ -1950,17 +1945,9 @@ int g_sfx_vol  = 100;   /* 50..150; boosting can overdrive */
 
 /* Mix CD audio in the classic core with EFSDL/EFPAN of slots 16/17 (EXTS L/R), as the hardware does
    (previously added raw, which made music too loud and masked effects). */
-static int s_cdpegel = -1;
-static int CdPegelAn(void)
-{
-  if (s_cdpegel < 0) {
-    s_cdpegel = 1;
-  }
-  return s_cdpegel;
-}
 /* Scale factor (1/256) for CD audio routed through the DSP (slots 16/17 muted). */
 static int s_cddsp = -1;
-static int CdDspFaktor(void)
+static int CdDspFactor(void)
 {
   if (s_cddsp < 0) {
     s_cddsp = 16;
@@ -1971,14 +1958,6 @@ static int CdDspFaktor(void)
 /* Fill EXTS (CD input, registers 0xEE0/0xEE2) in the classic core, as the new core and the hardware do.
    The Kyuutenkai sound driver averages |EXTS| into sound RAM 0x790 and the master waits for it; with exts=0 the
    game stays black after START. */
-static int s_extskl = -1;
-static int ExtsKlassikAn(void)
-{
-  if (s_extskl < 0) {
-    s_extskl = 1;
-  }
-  return s_extskl;
-}
 
 void ScspSetCddaVolume(int v) { g_cdda_vol = (v < 0) ? 0 : (v > 150 ? 150 : v); }
 void ScspSetSfxVolume (int v) { g_sfx_vol  = (v < 0) ? 0 : (v > 150 ? 150 : v); }
@@ -1989,27 +1968,17 @@ static u32 cdda_out_left;                       // Bytes of CDDA left to output
 
 static void scsp_env_null_next(slot_t *slot);
 /* End of slot (sample without loop, end of sustain/release): only ecnt = DE. */
-#define SCSP_SLOT_ENDE(slot) do { (slot)->ecnt = SCSP_ENV_DE; } while (0)
+#define SCSP_SLOT_END(slot) do { (slot)->ecnt = SCSP_ENV_DE; } while (0)
 
 /* scsp_reset sets lfofms/lfoems to 0 instead of 31 (= off) via memset, and an LFO register write with LFORE=1
    returns before PLFOS/ALFOS are set. With lfofms=0, SCSP_UPDATE_PHASE_LFO shifts by (0-7), giving a huge pitch
    offset and bursts of noise (seen in Exhumed). The new core always reads PLFOS/ALFOS. */
-static int LfoInitAn(void) {
-  static int n = -1;
-  if (n < 0) n = 1;
-  return n;
-}
 /* Classic core without DSP: DSP-only slots (DISDL+EFSDL off, IMXL on) are output dry at the IMXL level. */
-static void DspDurch(slot_t *sl) {
-  static int an = -1;
-  if (an < 0) an = 1;
-  if (!an) return;
+static void DspPassthrough(slot_t *sl) {
   if (sl->disll == 31 && sl->dislr == 31 && sl->efsll == 31 && sl->efslr == 31 && sl->imxl != 31) {
     sl->disll = sl->dislr = sl->imxl;
   }
 }
-/* Optional interpolation in the classic core; read in scsp_reset. */
-static int s_interp_kl = 0;
 static void scsp_release_next(slot_t *slot);
 static void scsp_sustain_next(slot_t *slot);
 static void scsp_decay_next(slot_t *slot);
@@ -2067,10 +2036,16 @@ void scsp_check_interrupt() {
     lvmasked[1] >>= 1;
     lvmasked[2] >>= 1;
   }
+  static unsigned last_level = 0;   /* last level reported to the 68K */
   if (level != 0) {
     SCSPLOG("SCSP LV0=%08X, LV1=%08X, LV2=%08X, SCIPD = %08X, SCIEB = %08X\n",
       scsp.scilv0, scsp.scilv1, scsp.scilv2, scsp.scipd, scsp.scieb);
     scsp.sintf(level);
+    last_level = level;
+  }
+  else if (last_level != 0) {   /* report the drop to level 0 so the 68K interrupt is released (1.20.46) */
+    scsp.sintf(0);
+    last_level = 0;
   }
   
 }
@@ -2287,7 +2262,7 @@ scsp_release_next (slot_t *slot)
 {
   // end of release happened, update to process the next phase...
 
-  SCSP_SLOT_ENDE(slot);
+  SCSP_SLOT_END(slot);
   slot->einc = NULL;
   slot->ecmp = SCSP_ENV_DE + 1;
   slot->enxt = scsp_env_null_next;
@@ -2298,7 +2273,7 @@ scsp_sustain_next (slot_t *slot)
 {
   // end of sustain happened, update to process the next phase...
 
-  SCSP_SLOT_ENDE(slot);
+  SCSP_SLOT_END(slot);
   slot->einc = NULL;
   slot->ecmp = SCSP_ENV_DE + 1;
   slot->enxt = scsp_env_null_next;
@@ -2523,8 +2498,6 @@ scsp_slot_set_b (u32 s, u32 a, u8 d)
       if (d & 0x80)
         {
           slot->lfoinc = -1;
-          if (!LfoInitAn ())   /* no early return: LFOF/PLFOWS are taken over */
-            return;
           slot->lfocnt = 0;
         }
       else if (slot->lfoinc == -1)
@@ -2532,7 +2505,7 @@ scsp_slot_set_b (u32 s, u32 a, u8 d)
           slot->lfocnt = 0;
         }
 
-      slot->lfoinc = ((d & 0x80) && LfoInitAn ()) ? 0 : scsp_lfo_step[(d >> 2) & 0x1F];
+      slot->lfoinc = (d & 0x80) ? 0 : scsp_lfo_step[(d >> 2) & 0x1F];
 
       switch (d & 3)
         {
@@ -2763,8 +2736,6 @@ scsp_slot_set_w (u32 s, s32 a, u16 d)
       if (d & 0x8000)
         {
           slot->lfoinc = -1;
-          if (!LfoInitAn ())   /* no early return: PLFOS/ALFOS/waveforms are taken over */
-            return;
           slot->lfocnt = 0;    /* LFO in reset: counter held at 0 */
         }
       else if (slot->lfoinc == -1)
@@ -2772,7 +2743,7 @@ scsp_slot_set_w (u32 s, s32 a, u16 d)
           slot->lfocnt = 0;
         }
 
-      slot->lfoinc = ((d & 0x8000) && LfoInitAn ()) ? 0 : scsp_lfo_step[(d >> 10) & 0x1F];
+      slot->lfoinc = (d & 0x8000) ? 0 : scsp_lfo_step[(d >> 10) & 0x1F];
       if ((d >> 5) & 7)
         slot->lfofms = ((d >> 5) & 7) + 7;
       else
@@ -3328,29 +3299,21 @@ scsp_get_w (u32 a)
   out = (s32) slot->buf8[(slot->fcnt >> SCSP_FREQ_LB)];
 #else
 #define SCSP_GET_OUT_8B \
-  { u32 i_ = slot->fcnt >> SCSP_FREQ_LB; out = (s32) slot->buf8[i_ ^ 1]; \
-    if (s_interp_kl) { s32 f_ = (s32)((slot->fcnt >> (SCSP_FREQ_LB - 6)) & 0x3F); u32 n_ = SCSP_INTERP_NEXT(i_); \
-      out = (out * (64 - f_) + (s32) slot->buf8[n_ ^ 1] * f_) >> 6; } }
+  out = (s32) slot->buf8[(slot->fcnt >> SCSP_FREQ_LB) ^ 1];
 #endif
 
-/* Index of the following sample: at the loop end LSA (looping) or the same sample (not looping), never beyond LEA */
-#define SCSP_INTERP_NEXT(i_) \
-  (((i_) + 1 > (slot->lea >> SCSP_FREQ_LB)) ? (slot->lpctl ? (slot->lsa >> SCSP_FREQ_LB) : (i_)) : (i_) + 1)
-
 #define SCSP_GET_OUT_16B \
-  { u32 i_ = slot->fcnt >> SCSP_FREQ_LB; out = (s32) slot->buf16[i_]; \
-    if (s_interp_kl) { s32 f_ = (s32)((slot->fcnt >> (SCSP_FREQ_LB - 6)) & 0x3F); u32 n_ = SCSP_INTERP_NEXT(i_); \
-      out = (out * (64 - f_) + (s32) slot->buf16[n_] * f_) >> 6; } }
+  out = (s32) slot->buf16[(slot->fcnt >> SCSP_FREQ_LB)];
 
 #define SCSP_ENV_IDX \
   (slot->ecnt >> SCSP_ENV_LB)
 
 #define SCSP_GET_ENV \
-  slot->env = (__builtin_expect(slot->sdir != 0, 0) && s_sdirfix > 0) ? SCSP_ENV_MASK : \
+  slot->env = __builtin_expect(slot->sdir != 0, 0) ? SCSP_ENV_MASK : \
               scsp_env_table[SCSP_ENV_IDX] * slot->tl / 1024;
 
 #define SCSP_GET_ENV_LFO \
-  slot->env = (__builtin_expect(slot->sdir != 0, 0) && s_sdirfix > 0) ? SCSP_ENV_MASK : \
+  slot->env = __builtin_expect(slot->sdir != 0, 0) ? SCSP_ENV_MASK : \
               (scsp_env_table[SCSP_ENV_IDX] * slot->tl / 1024) - \
               (slot->lfoemw[(slot->lfocnt >> SCSP_LFO_LB) & SCSP_LFO_MASK] >> \
                slot->lfoems);
@@ -3409,7 +3372,7 @@ scsp_get_w (u32 a)
       }                                       \
     else                                      \
       {                                       \
-        SCSP_SLOT_ENDE(slot);                 \
+        SCSP_SLOT_END(slot);                 \
         return;                               \
       }                                       \
   }
@@ -3426,7 +3389,7 @@ scsp_get_w (u32 a)
         }                                                            \
       else                                                           \
         {                                                            \
-          SCSP_SLOT_ENDE(slot);                                      \
+          SCSP_SLOT_END(slot);                                      \
           return;                                                    \
         }                                                            \
     }
@@ -4064,33 +4027,25 @@ static void (*scsp_slot_update_p[2][2][2][2][2])(slot_t *slot) =
 };
 
 
-/* FM in the classic core (see FmKlassikBlock). */
-static int s_fmkl = -1;
+/* FM in the classic core (see FmClassicBlock). */
 static s16 s_fm_prev[32], s_fm_cur[32];
 static s16 s_fm_prev2[32];   /* sample n-2 */
-static int s_fmstapel_kl = -1;
-static s32 FmStapelKl(int m, int k)   /* FM stack delay selection */
+static int s_fmstack_classic = -1;
+static s32 FmStackClassic(int m, int k)   /* FM stack delay selection */
 {
   int j = (k + m) & 31, um = (k + (m & 31)) >= 32;
   if (m & 0x20) return um ? s_fm_cur[j] : s_fm_prev[j];
   return um ? s_fm_prev[j] : s_fm_prev2[j];
 }
 static int s_fm_warm = 0;
-static int FmKlassikAn(void)
-{
-  if (s_fmkl < 0) {
-    s_fmkl = 1;
-  }
-  return s_fmkl;
-}
 
-static void FmKlassikSlotSample(slot_t *slot, u32 pos, int k)
+static void FmClassicSlotSample(slot_t *slot, u32 pos, int k)
 {
   s32 out, md = 0, o16;
-  if (s_fmstapel_kl < 0) s_fmstapel_kl = 1;
-  if (s_fmstapel_kl) {
+  if (s_fmstack_classic < 0) s_fmstack_classic = 1;
+  if (s_fmstack_classic) {
     if (slot->mdl >= 5) {
-      const s32 xd = FmStapelKl(slot->mdx, k), yd = FmStapelKl(slot->mdy, k);
+      const s32 xd = FmStackClassic(slot->mdx, k), yd = FmStackClassic(slot->mdy, k);
       md = ((xd + yd) / 2) >> (0xF - slot->mdl);
     }
   } else if (slot->mdl) {
@@ -4129,11 +4084,10 @@ static void FmKlassikSlotSample(slot_t *slot, u32 pos, int k)
 }
 
 /* Returns 1 if the block was fully computed here (FM path), 0 for the normal path. */
-static int FmKlassikBlock(u32 len)
+static int FmClassicBlock(u32 len)
 {
   int k, fm = 0;
   u32 i;
-  if (!FmKlassikAn()) return 0;
   for (k = 0; k < 32; k++)
     if (scsp.slot[k].mdl && scsp.slot[k].ecnt < SCSP_ENV_DE && !scsp.slot[k].ssctl) { fm++; }
   if (!fm) { s_fm_warm = 0; return 0; }
@@ -4145,19 +4099,19 @@ static int FmKlassikBlock(u32 len)
       for (i = 0; i < len; i++)
         if ((slot->fcnt += slot->finc) > slot->lea) {
           if (slot->lpctl) slot->fcnt = slot->lsa;
-          else { SCSP_SLOT_ENDE(slot); break; }
+          else { SCSP_SLOT_END(slot); break; }
         }
       continue;
     }
     if ((slot->disll == 31) && (slot->dislr == 31)) { slot->disll = slot->efsll; slot->dislr = slot->efslr; }
-    DspDurch (slot);
+    DspPassthrough (slot);
   }
   for (i = 0; i < len; i++) {
     for (k = 0; k < 32; k++) {
       slot_t *slot = &scsp.slot[k];
       s_fm_cur[k] = 0;
       if (slot->ecnt >= SCSP_ENV_DE || slot->ssctl) continue;
-      FmKlassikSlotSample(slot, i, k);
+      FmClassicSlotSample(slot, i, k);
     }
     for (k = 0; k < 32; k++) { s_fm_prev2[k] = s_fm_prev[k]; s_fm_prev[k] = s_fm_cur[k]; }
   }
@@ -4172,7 +4126,7 @@ scsp_update (s32 *bufL, s32 *bufR, u32 len)
    scsp_bufL = bufL;
    scsp_bufR = bufR;
 
-   if (FmKlassikBlock(len)) goto fmklassik_fertig;
+   if (FmClassicBlock(len)) goto fmclassic_done;
 
    for (slot = &(scsp.slot[0]); slot < &(scsp.slot[32]); slot++)
    {
@@ -4192,7 +4146,7 @@ scsp_update (s32 *bufL, s32 *bufR, u32 len)
                if (slot->lpctl) slot->fcnt = slot->lsa;
                else
                {
-                  SCSP_SLOT_ENDE(slot);
+                  SCSP_SLOT_END(slot);
                   break;
                }
             }
@@ -4210,7 +4164,7 @@ scsp_update (s32 *bufL, s32 *bufR, u32 len)
          slot->disll = slot->efsll;
          slot->dislr = slot->efslr;
       }
-      DspDurch (slot);
+      DspPassthrough (slot);
 
       // SCSPLOG("update : VL=%d  VR=%d CNT=%.8X STEP=%.8X\n", slot->disll, slot->dislr, slot->fcnt, slot->finc);
 
@@ -4220,7 +4174,7 @@ scsp_update (s32 *bufL, s32 *bufR, u32 len)
       [(slot->disll == 31) ? 0 : 1]
       [(slot->dislr == 31) ? 0 : 1](slot);
    }
-fmklassik_fertig: ;
+fmclassic_done: ;
 
 
    /* Scale game sound effects: here the 32 channels have finished writing into the buffer, CD music is added
@@ -4251,9 +4205,9 @@ fmklassik_fertig: ;
       /* fetch the level of slots 16/17 (EXTS L/R) once per block */
       const int cp_16l = scsp.slot[16].efsll, cp_16r = scsp.slot[16].efslr;
       const int cp_17l = scsp.slot[17].efsll, cp_17r = scsp.slot[17].efslr;
-      const int cp_an = CdPegelAn() && !(cp_16l == 31 && cp_16r == 31 && cp_17l == 31 && cp_17r == 31);
+      const int cp_on = !(cp_16l == 31 && cp_16r == 31 && cp_17l == 31 && cp_17r == 31);
       /* Slots 16/17 muted: the game routes CD through the DSP (which the classic core lacks), so apply a fixed attenuation instead of raw. */
-      const int cd_dsp_f = (cp_16l == 31 && cp_16r == 31 && cp_17l == 31 && cp_17r == 31) ? CdDspFaktor() : 256;
+      const int cd_dsp_f = (cp_16l == 31 && cp_16r == 31 && cp_17l == 31 && cp_17r == 31) ? CdDspFactor() : 256;
 
       /* May need to wrap around the buffer, so use nested loops */
       while (scsp_buf_pos < scsp_buf_len)
@@ -4277,7 +4231,7 @@ fmklassik_fertig: ;
                const s32 cd_l = (s32)(s16)((buf[1] << 8) | buf[0]);
                const s32 cd_r = (s32)(s16)((buf[3] << 8) | buf[2]);
                s32 out_r;
-               if (cp_an) {   /* efsl = (7-EFSDL)+SCSP_ENV_HB (+pan), 31 = muted, 6 dB per step */
+               if (cp_on) {   /* efsl = (7-EFSDL)+SCSP_ENV_HB (+pan), 31 = muted, 6 dB per step */
                   out   = (cp_16l < 31 ? (cd_l >> (cp_16l - SCSP_ENV_HB)) : 0) + (cp_17l < 31 ? (cd_r >> (cp_17l - SCSP_ENV_HB)) : 0);
                   out_r = (cp_16r < 31 ? (cd_l >> (cp_16r - SCSP_ENV_HB)) : 0) + (cp_17r < 31 ? (cd_r >> (cp_17r - SCSP_ENV_HB)) : 0);
                } else if (cd_dsp_f != 256) { out = (cd_l * cd_dsp_f) >> 8; out_r = (cd_r * cd_dsp_f) >> 8; }
@@ -4293,7 +4247,7 @@ fmklassik_fertig: ;
             /* at g_cdda_vol == 0, out == 0 so nothing is added, but the buffer still advances normally. */
          }
 
-         if (this_len > 0 && ExtsKlassikAn()) {   /* last raw sample of the block */
+         if (this_len > 0) {   /* last raw sample of the block */
             const u8 *lb = buf - 4;
             scsp_dsp.exts[0] = (s16)((lb[1] << 8) | lb[0]);
             scsp_dsp.exts[1] = (s16)((lb[3] << 8) | lb[2]);
@@ -4971,7 +4925,7 @@ scsp_reset (void)
 		// Make sure lfofmw/lfoemw have sane values
 		slot->lfofmw = scsp_lfo_sawt_f;
 		slot->lfoemw = scsp_lfo_sawt_e;
-		if (LfoInitAn ()) { slot->lfofms = 31; slot->lfoems = 31; }  /* depth off instead of 0 (0 = shift by -7) */
+		slot->lfofms = 31; slot->lfoems = 31;  /* depth off instead of 0 (0 = shift by -7) */
     }
 
   if (use_new_scsp)
@@ -5238,17 +5192,17 @@ c68k_interrupt_handler (u32 level)
 
 //////////////////////////////////////////////////////////////////////////////
 
-/* Option: 1 = only queue the sound request; the main thread delivers it in ScuExec (scu.c ScuSndReqZustellen).
+/* Option: 1 = only queue the sound request; the main thread delivers it in ScuExec (scu.c ScuSndReqDeliver).
    Reason: SendInterrupt from the SCSP thread races with IMS writes of the main thread. */
-int g_sndreqzug = -1;
-volatile int g_sndreq_vorgemerkt = 0;
+int g_sndreq_queued_mode = -1;
+volatile int g_sndreq_pending = 0;
 static void
 scu_interrupt_handler (void)
 {
-  if (g_sndreqzug < 0) {
-    g_sndreqzug = 1;
+  if (g_sndreq_queued_mode < 0) {
+    g_sndreq_queued_mode = 1;
   }
-  if (g_sndreqzug) { __atomic_store_n(&g_sndreq_vorgemerkt, 1, __ATOMIC_RELEASE); return; }
+  if (g_sndreq_queued_mode) { __atomic_store_n(&g_sndreq_pending, 1, __ATOMIC_RELEASE); return; }
   // send interrupt to scu
   ScuSendSoundRequest ();
 }
@@ -5619,58 +5573,58 @@ M68KStop (void)
 
 /* Load/reset audio handshake: pauses the SDL output during the lock (refill only if still below the target).
    Handshake: the caller sets g_scsp_lock=1 (seq_cst) and waits until the sound thread sits in the lock
-   loop (g_ladeton_geparkt=1). The thread sets the flag before first reading the lock and clears it after leaving;
-   it reads the lock once more afterwards (Dekker) and parks again if it is set. So geparkt==1 at the caller
+   loop (g_loadsnd_parked=1). The thread sets the flag before first reading the lock and clears it after leaving;
+   it reads the lock once more afterwards (Dekker) and parks again if it is set. So parked==1 at the caller
    means the thread executes no more samples until release; the timedwait branch (a sample without lock check after
    pthread_cond_signal) also lies before the lock loop.
    Timeout 20 ms (ScspAsynMainCpuTime may wait on q_scsp_frame_start of the emulation thread): then sleep
    the rest of the old fixed time, so never shorter than the fixed sleep. */
 /* Set by sndsdl.c (stretch path only), otherwise NULL = no-op. Values are in frames. */
-int (*g_ladeton_pause)(int was, unsigned int *fuell, unsigned int *aufgefuellt, unsigned int *ziel) = NULL;
-static volatile int g_ladeton_geparkt = 0;
-static int g_ladeton_geladen = 0;         /* SoundLoadState ran since ScspLockThread: load, otherwise save */
-static int g_ladeton_pause_aktiv = 0;
-static u64 LadetonNs(void) {
+int (*g_loadsnd_pause)(int action, unsigned int *fill_amount, unsigned int *filled_up, unsigned int *goal) = NULL;
+static volatile int g_loadsnd_parked = 0;
+static int g_loadsnd_loaded = 0;         /* SoundLoadState ran since ScspLockThread: load, otherwise save */
+static int g_loadsnd_pause_active = 0;
+static u64 LoadSndNs(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
 }
 /* Sound thread: entered only if g_scsp_lock was set. */
-static void LadetonParken(void) {
+static void LoadSndPark(void) {
   for (;;) {
-    __atomic_store_n(&g_ladeton_geparkt, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_loadsnd_parked, 1, __ATOMIC_SEQ_CST);
     while (__atomic_load_n(&g_scsp_lock, __ATOMIC_SEQ_CST)) { YabThreadUSleep(1000); }
-    __atomic_store_n(&g_ladeton_geparkt, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_loadsnd_parked, 0, __ATOMIC_SEQ_CST);
     if (!__atomic_load_n(&g_scsp_lock, __ATOMIC_SEQ_CST)) break;
   }
 }
 /* Caller: set the lock and wait for parking. Returns 1 = parked (or no thread), 0 = timeout. */
-static int LadetonSperren(u64 *gewartet_ns) {
-  const u64 t0 = LadetonNs();
+static int LoadSndBlock(u64 *waited_ns) {
+  const u64 t0 = LoadSndNs();
   __atomic_store_n(&g_scsp_lock, 1, __ATOMIC_SEQ_CST);
-  *gewartet_ns = 0;
+  *waited_ns = 0;
   if (!thread_running) return 1;   /* no sound thread, nothing to park */
   for (;;) {
-    if (__atomic_load_n(&g_ladeton_geparkt, __ATOMIC_SEQ_CST)) { *gewartet_ns = LadetonNs() - t0; return 1; }
-    *gewartet_ns = LadetonNs() - t0;
-    if (*gewartet_ns >= 20000000ULL) return 0;
+    if (__atomic_load_n(&g_loadsnd_parked, __ATOMIC_SEQ_CST)) { *waited_ns = LoadSndNs() - t0; return 1; }
+    *waited_ns = LoadSndNs() - t0;
+    if (*waited_ns >= 20000000ULL) return 0;
     YabThreadUSleep(500);
   }
 }
 /* Pause the output before the lock is set (this also covers the handshake wait) */
-static void LadetonPauseStart(void) {
-  int (*fn)(int, unsigned int *, unsigned int *, unsigned int *) = g_ladeton_pause;
+static void LoadSndPauseStart(void) {
+  int (*fn)(int, unsigned int *, unsigned int *, unsigned int *) = g_loadsnd_pause;
   unsigned int b = 0, a = 0, z = 0;
-  if (fn == NULL || g_ladeton_pause_aktiv) return;
-  if (fn(1, &b, &a, &z)) g_ladeton_pause_aktiv = 1;
+  if (fn == NULL || g_loadsnd_pause_active) return;
+  if (fn(1, &b, &a, &z)) g_loadsnd_pause_active = 1;
 }
-/* Resume the output. auffuellen=1 (load/reset): refill if below the target; 0 (save): never. */
-static void LadetonPauseEnde(int auffuellen) {
-  int (*fn)(int, unsigned int *, unsigned int *, unsigned int *) = g_ladeton_pause;
+/* Resume the output. fill_up=1 (load/reset): refill if below the target; 0 (save): never. */
+static void LoadSndPauseEnd(int fill_up) {
+  int (*fn)(int, unsigned int *, unsigned int *, unsigned int *) = g_loadsnd_pause;
   unsigned int v = 0, a = 0, z = 0;
-  if (!g_ladeton_pause_aktiv || fn == NULL) return;
-  fn(auffuellen ? 0 : -1, &v, &a, &z);
-  g_ladeton_pause_aktiv = 0;
+  if (!g_loadsnd_pause_active || fn == NULL) return;
+  fn(fill_up ? 0 : -1, &v, &a, &z);
+  g_loadsnd_pause_active = 0;
 }
 /* end of load/reset audio handshake */
 
@@ -5678,12 +5632,12 @@ void
 ScspReset (void)
 {
   /* handshake instead of a fixed 100 ms; pauses the output */
-  u64 gew = 0;
-  LadetonPauseStart();
-  const int geparkt = LadetonSperren(&gew);
-  if (!geparkt) YabThreadUSleep(100000 - (unsigned)(gew / 1000));   /* timeout: sleep the rest of the old fixed time */
+  u64 waited = 0;
+  LoadSndPauseStart();
+  const int parked = LoadSndBlock(&waited);
+  if (!parked) YabThreadUSleep(100000 - (unsigned)(waited / 1000));   /* timeout: sleep the rest of the old fixed time */
   scsp_reset();
-  LadetonPauseEnde(1);
+  LoadSndPauseEnd(1);
   __atomic_store_n(&g_scsp_lock, 0, __ATOMIC_SEQ_CST);
 }
 
@@ -5739,7 +5693,7 @@ void M68KExec(s32 cycles)
    it prevents dropouts, but FAD-clocked games can play voice scenes up to twice as fast with it. */
 /* Set by the frontend from the game config (ScspSetCddaMute); also read in the sample loop (44100/s). */
 int g_cdda_mute = -1;
-void ScspSetCddaMute(int an) { g_cdda_mute = an ? 1 : 0; }
+void ScspSetCddaMute(int on_val) { g_cdda_mute = on_val ? 1 : 0; }
 /* `cd volume = 0` (menu "Sound Volume" -> CD Music -> OFF) takes the same hard path as `mute cdda`: the sectors are not
    accepted at all, so there is no 2352-byte memcpy and no ring management. `g_cdda_vol` is set live by the menu
    (ScspSetCddaVolume) and read fresh on every call, so turning it back up works; it takes a few seconds until the ring
@@ -5918,7 +5872,7 @@ void
 ScspReceiveCDDA (const u8 *sector)
 {	
    /* Only the timing adjustment is skipped when boost is off; the copy into the ring always runs. */
-   /* With `mute cdda` the sectors are not accepted at all: no 2352-byte memcpy, no ring management. This pays off
+   /* With `mute cdda` the sectors are not accepted at all: no 2352-byte memcpy, no ring management. This matters
       because the CD block runs in the emulation thread (cs2.c calls ScspReceiveCDDA) while sound generation runs
       on another core. `cdda boost` adapts the CD read speed so the ring does not run empty below full emulation
       speed; it is cheap and stays on. */
@@ -6005,17 +5959,17 @@ int new_scsp_update_samples(s32 *bufL, s32 *bufR, int scspsoundlen)
 
 void ScspLockThread() {
   /* handshake instead of 2x16666 us (pause the output first) */
-  u64 gewartet = 0;
-  g_ladeton_geladen = 0;
-  LadetonPauseStart();
-  if (!LadetonSperren(&gewartet)) YabThreadUSleep(16666*2 - (unsigned)(gewartet / 1000));   /* timeout: rest */
+  u64 waited_flag = 0;
+  g_loadsnd_loaded = 0;
+  LoadSndPauseStart();
+  if (!LoadSndBlock(&waited_flag)) YabThreadUSleep(16666*2 - (unsigned)(waited_flag / 1000));   /* timeout: rest */
 }
 
 void ScspUnLockThread() {
   /* after LOADING refill/resume (saving: never refill), then release */
-  const int laden = g_ladeton_geladen;
-  LadetonPauseEnde(laden);   /* saving: the pause usually already ended in ScspSaveState */
-  g_ladeton_geladen = 0;
+  const int load_flag = g_loadsnd_loaded;
+  LoadSndPauseEnd(load_flag);   /* saving: the pause usually already ended in ScspSaveState */
+  g_loadsnd_loaded = 0;
   __atomic_store_n(&g_scsp_lock, 0, __ATOMIC_SEQ_CST);
 }
 
@@ -6052,13 +6006,7 @@ static INLINE u64 YabaTicksNs(void)
 
 /* How many times per frame the sound thread (68k/SCSP) syncs with real time (frame_div). The value 4 applies to all
    titles (needed e.g. by Thunder Force V, which lost frames and ran slowly with 1); 1 is the former behaviour. */
-static int scsp_teile(void) {
-  static int t = -1;
-  if (t < 0) {
-    t = 4;
-  }
-  return t;
-}
+#define SCSP_SYNCS_PER_FRAME 4
 
 void ScspAsynMainCpuTime( void * p ){
 
@@ -6070,7 +6018,7 @@ void ScspAsynMainCpuTime( void * p ){
   int frame = 0;
   int frame_count = 0;
   int i;
-  int frame_div = scsp_teile();
+  int frame_div = SCSP_SYNCS_PER_FRAME;
   int framecnt = 188160 / frame_div; // 11289600/60
   int hzcheck = 0;
 
@@ -6080,7 +6028,7 @@ void ScspAsynMainCpuTime( void * p ){
 #endif
   /* initialize the producer fixes in the cpu mode too; the phase lock only affects ScspAsynMainRealtime */
 
-  if (YabaKernModus() != 3) YabThreadSetCurrentThreadAffinityMask( 0x03 );
+  YabThreadSetCurrentThreadAffinityMask( 0x03 );
   before = YabaTicksNs();
   u32 wait_clock = 0;
   u64 pre_m68k_cycle = 0;
@@ -6092,7 +6040,7 @@ void ScspAsynMainCpuTime( void * p ){
   now = 0;
   before = 0;
   while (thread_running){
-    if (g_scsp_lock) LadetonParken();   /* lock loop with park notification */
+    if (g_scsp_lock) LoadSndPark();   /* lock loop with park notification */
     u64 m68k_done_counter = 0;
     u64 m68k_integer_part = 0;
     u64 m68k_cycle = 0;
@@ -6155,7 +6103,7 @@ void ScspAsynMainRealtime(void * p) {
   int frame = 0; 
   int frame_count = 0;
   int i;
-  int frame_div = scsp_teile();
+  int frame_div = SCSP_SYNCS_PER_FRAME;
   /* framecnt and the target period must follow the video format (NTSC: 188160 cycles = 735 samples, 16.667 ms; PAL:
      scspsoundlen = 44100/50 = 882). Otherwise PAL publishes more samples per second than the device consumes, the
      ring stays full and audio plays too fast. Derived from yabsys.IsPal and updated per frame, since the video format
@@ -6180,7 +6128,7 @@ void ScspAsynMainRealtime(void * p) {
   const u32 base_clock = (u32)((644.8412698 / ((double)samplecnt / (double)step)) * (1 << CLOCK_SYNC_SHIFT));
 
 
-  if (YabaKernModus() != 3) YabThreadSetCurrentThreadAffinityMask(0x03);
+  YabThreadSetCurrentThreadAffinityMask(0x03);
   before = YabaTicksNs();
   u32 wait_clock = 0;
 
@@ -6199,7 +6147,7 @@ void ScspAsynMainRealtime(void * p) {
         phase_primed = 0;
       }
     }
-    if (g_scsp_lock) LadetonParken();   /* lock loop with park notification */
+    if (g_scsp_lock) LoadSndPark();   /* lock loop with park notification */
     // Run 1 sample(44100Hz)
     for (i = 0; i < samplecnt; i += step) {
       MM68KExec(step);
@@ -6928,7 +6876,7 @@ SoundSaveState (FILE *fp)
   ywrite(&check, (void *)&scsplines, sizeof(u32), 1, fp);
 
 
-  LadetonPauseEnde(0);   /* the lock is released mid-save here: resume output, never refill */
+  LoadSndPauseEnd(0);   /* the lock is released mid-save here: resume output, never refill */
   g_scsp_lock = 0;
 
   return StateFinishHeader (fp, offset);
@@ -6937,7 +6885,7 @@ SoundSaveState (FILE *fp)
 //////////////////////////////////////////////////////////////////////////////
 
 /* core in which the state being loaded was saved (-1 = unknown) */
-static int s_standneu_kern_datei = -1;
+static int s_state_new_core_file = -1;
 
 int
 SoundLoadState (FILE *fp, int version, int size)
@@ -6947,8 +6895,8 @@ SoundLoadState (FILE *fp, int version, int size)
   u8 nextphase;
   IOCheck_struct check = { 0, 0 };
 
-  g_ladeton_geladen = 1;   /* ScspUnLockThread refills after a load */
-  s_standneu_kern_datei = -1;   /* otherwise the core value of an earlier loaded state would remain */
+  g_loadsnd_loaded = 1;   /* ScspUnLockThread refills after a load */
+  s_state_new_core_file = -1;   /* otherwise the core value of an earlier loaded state would remain */
 
   /* The CD audio ring is reset at the END of this function, not here: cdda_next_in/cdda_out_left are read back
      from the state further below (version >= 3) and would overwrite an early reset. The ring contents (cddabuf.data)
@@ -6989,9 +6937,9 @@ SoundLoadState (FILE *fp, int version, int size)
   /* The SCSP core is an emulator setting, not game state: the value is read to keep the data stream aligned, but
      discarded (a state file must not decide which core runs). */
   {
-    int kern_aus_datei = 0;
-    yread(&check, (void *)&kern_aus_datei, 1, sizeof(int), fp);
-    s_standneu_kern_datei = kern_aus_datei;
+    int core_from_file = 0;
+    yread(&check, (void *)&core_from_file, 1, sizeof(int), fp);
+    s_state_new_core_file = core_from_file;
     {
     }
   }
@@ -7069,8 +7017,8 @@ SoundLoadState (FILE *fp, int version, int size)
   /* State saved in the classic core while the new core is active: the state carries only zeros for the new core.
      Reset it cleanly first (RELEASE, 0x3FF), then regenerate with KYONEX masked, finally key on the voices that
      were sounding in the classic core (below). The DSP program is loaded afterwards. */
-  int standneu = (use_new_scsp && s_standneu_kern_datei == 0);
-  if (standneu) {
+  int state_new = (use_new_scsp && s_state_new_core_file == 0);
+  if (state_new) {
     new_scsp_reset(&new_scsp);
   }
   if (version > 1)
@@ -7082,7 +7030,7 @@ SoundLoadState (FILE *fp, int version, int size)
             //scsp_slot_set_w (i, 0x1E - i2, scsp_slot_get_w (i, 0x1E - i2));
             u32 addr = (i << 5) + 0x1E - i2;
             u16 val = *(u16 *)&scsp_isr[addr ^ 2];
-            if (standneu && (addr & 0x1E) == 0) val &= 0xEFFF;   /* no spurious KYONEX */
+            if (state_new && (addr & 0x1E) == 0) val &= 0xEFFF;   /* no spurious KYONEX */
             scsp_w_w(addr, val);
           }
         }
@@ -7227,7 +7175,7 @@ SoundLoadState (FILE *fp, int version, int size)
             }
         }
 
-      if (standneu) {   /* retrigger sounding voices in the new core */
+      if (state_new) {   /* retrigger sounding voices in the new core */
         int k;
         for (k = 0; k < 32; k++)
           if (scsp.slot[k].ecurp != SCSP_ENV_RELEASE && new_scsp.slots[k].regs.kb) { keyon(&new_scsp.slots[k]); }
@@ -7245,8 +7193,8 @@ SoundLoadState (FILE *fp, int version, int size)
           rk = 1;
         }
         if (rk) {
-          if (s_standneu_kern_datei == 0 && use_new_scsp)       scsp.rbp = (scsp.rbp >> 13) & 0x7F;
-          else if (s_standneu_kern_datei == 1 && !use_new_scsp) scsp.rbp = (scsp.rbp & 0x7F) << 13;
+          if (s_state_new_core_file == 0 && use_new_scsp)       scsp.rbp = (scsp.rbp >> 13) & 0x7F;
+          else if (s_state_new_core_file == 1 && !use_new_scsp) scsp.rbp = (scsp.rbp & 0x7F) << 13;
         }
       }
 
@@ -7315,26 +7263,26 @@ SoundLoadState (FILE *fp, int version, int size)
     yread(&check, (void *)&ScspInternalVars->scsptiming2, sizeof(u32), 1, fp);
 
     if (version >= 3) {
-      const int standkern_alt = 0;
+      const int statecore_old = 0;
       yread(&check, (void *)&cdda_next_in, sizeof(u32), 1, fp);
       yread(&check, (void *)&cdda_out_left, sizeof(u32), 1, fp);
       yread(&check, (void *)&scsp_mute_flags, sizeof(u32), 1, fp);
       /* scspsoundlen is derived from the video format; a value from the file is ignored (it would not match
          scspsoundbufsize / scsp_alloc_bufs(), see ScspChangeVideoFormat) */
-      { u32 len_aus_datei = 0;
-        yread(&check, (void *)&len_aus_datei, sizeof(u32), 1, fp);
-        if (standkern_alt) scspsoundlen = len_aus_datei; }
+      { u32 len_from_file = 0;
+        yread(&check, (void *)&len_from_file, sizeof(u32), 1, fp);
+        if (statecore_old) scspsoundlen = len_from_file; }
       yread(&check, (void *)&scsplines, sizeof(u32), 1, fp);
     }
 
   /* Reset the CD audio ring here, after cdda_next_in/cdda_out_left were read back from the state (an earlier reset
      would be overwritten). The CD block refills the ring; at most one sector of music is lost. */
   {
-    static int reset_an = -1;
-    if (reset_an < 0) {
-      reset_an = 1;
+    static int reset_on = -1;
+    if (reset_on < 0) {
+      reset_on = 1;
     }
-    if (reset_an) {
+    if (reset_on) {
       cdda_next_in  = 0;
       cdda_out_left = 0;
     }
@@ -7345,11 +7293,11 @@ SoundLoadState (FILE *fp, int version, int size)
      RAM is loaded, so it fetches SP and PC from the reset vector of the newly loaded driver. Runs once per state
      load. This does not repair the state format; a fresh (v4) state is still the clean solution. */
   {
-    static int m68kreset_an = -1;
-    if (m68kreset_an < 0) {
-      m68kreset_an = 1;
+    static int m68kreset_on = -1;
+    if (m68kreset_on < 0) {
+      m68kreset_on = 1;
     }
-    if (m68kreset_an && version < 4) {
+    if (m68kreset_on && version < 4) {
       M68K->Reset();
     }
   }

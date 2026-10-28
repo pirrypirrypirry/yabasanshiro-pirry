@@ -919,27 +919,27 @@ void PerAxisValue(u32 key, u8 val)
                   if (perkeyconfig[i].base->name == PERANALOG_AXIS1)
                   {
                      static int stx2808_ax1_state = 0;
-                     int neu = (val <= 0x40) ? -1 : (val >= 0xC0) ? 1 : 0;
-                     if (neu != stx2808_ax1_state)
+                     int new_val = (val <= 0x40) ? -1 : (val >= 0xC0) ? 1 : 0;
+                     if (new_val != stx2808_ax1_state)
                      {
                         if (stx2808_ax1_state == -1) perkeyconfig[PERPAD_LEFT].base->Release(perkeyconfig[PERPAD_LEFT].controller);
                         if (stx2808_ax1_state ==  1) perkeyconfig[PERPAD_RIGHT].base->Release(perkeyconfig[PERPAD_RIGHT].controller);
-                        if (neu == -1) perkeyconfig[PERPAD_LEFT].base->Press(perkeyconfig[PERPAD_LEFT].controller);
-                        if (neu ==  1) perkeyconfig[PERPAD_RIGHT].base->Press(perkeyconfig[PERPAD_RIGHT].controller);
-                        stx2808_ax1_state = neu;
+                        if (new_val == -1) perkeyconfig[PERPAD_LEFT].base->Press(perkeyconfig[PERPAD_LEFT].controller);
+                        if (new_val ==  1) perkeyconfig[PERPAD_RIGHT].base->Press(perkeyconfig[PERPAD_RIGHT].controller);
+                        stx2808_ax1_state = new_val;
                      }
                   }
                   if (perkeyconfig[i].base->name == PERANALOG_AXIS2)
                   {
                      static int stx2808_ax2_state = 0;
-                     int neu = (val <= 0x40) ? -1 : (val >= 0xC0) ? 1 : 0;
-                     if (neu != stx2808_ax2_state)
+                     int new_val = (val <= 0x40) ? -1 : (val >= 0xC0) ? 1 : 0;
+                     if (new_val != stx2808_ax2_state)
                      {
                         if (stx2808_ax2_state == -1) perkeyconfig[PERPAD_UP].base->Release(perkeyconfig[PERPAD_UP].controller);
                         if (stx2808_ax2_state ==  1) perkeyconfig[PERPAD_DOWN].base->Release(perkeyconfig[PERPAD_DOWN].controller);
-                        if (neu == -1) perkeyconfig[PERPAD_UP].base->Press(perkeyconfig[PERPAD_UP].controller);
-                        if (neu ==  1) perkeyconfig[PERPAD_DOWN].base->Press(perkeyconfig[PERPAD_DOWN].controller);
-                        stx2808_ax2_state = neu;
+                        if (new_val == -1) perkeyconfig[PERPAD_UP].base->Press(perkeyconfig[PERPAD_UP].controller);
+                        if (new_val ==  1) perkeyconfig[PERPAD_DOWN].base->Press(perkeyconfig[PERPAD_DOWN].controller);
+                        stx2808_ax2_state = new_val;
                      }
                   }
                }

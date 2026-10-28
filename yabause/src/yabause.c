@@ -642,74 +642,37 @@ u64 g_m68K_dec_cycle = 0;
    Only SH2Exec slicing is affected: master/slave interleaving, FRT/WDT step,
    interrupt visibility and DMA step. ScuExec, M68KSync, SmpcExec and Cs2Exec
    are called once per line outside this loop. */
-extern int g_db_fein;   /* sh2core.c: lines with 3 slices after a doorbell */
+extern int g_db_fine;   /* sh2core.c: lines with 3 slices after a doorbell */
 /* After an FRT doorbell (sh2core.c), 263 lines are run with at least 3 slices.
    Finer slicing calls DMAProc more often, which titles depending on SH2 DMA
-   latency need. Dbf3Stueckelung() enables this. */
-static int Dbf3Stueckelung(void)
-{
-  static int v = -1;
-  if (v < 0) {
-    v = 1;
-  }
-  return v;
-}
+   latency need. */
 /* Couple the slicing to the doorbell density (global, not per title): if in at
-   least DbDichteAnteil() of the last 10 seconds some field had >= DbDichteSchwelle()
-   doorbells, DbDichteTeile() slices per line are used. Switching happens at most
+   least DB_DENSITY_SHARE of the last 10 seconds some field had >= DB_DENSITY_THRESHOLD
+   doorbells, DB_DENSITY_PARTS slices per line are used. Switching happens at most
    once per second, since switching every field is worse than coarse slicing. */
-extern unsigned int g_db_feld_n;
-static unsigned int g_db_fein_an = 0;     /* 1 = fine slicing this second */
-/* Adaptive slicing: if the master skipped at least TeileAdaptSchwelle() idle loops
+#define DB_DENSITY_THRESHOLD 150
+#define DB_DENSITY_SHARE     8
+#define DB_DENSITY_PARTS     10
+extern unsigned int g_db_field_n;
+static unsigned int g_db_fine_on = 0;     /* 1 = fine slicing this second */
+/* Adaptive slicing: if the master skipped at least PARTS_ADAPT_THRESHOLD idle loops
    in the previous field, use at least 3 slices in the next field. The master is
    waiting anyway, so the extra calls cost little; this avoids a master/slave race
    at cold boot in some titles. */
 extern unsigned int SH2DynGetLoopskip(SH2_struct *context);
-static int g_teile_adapt_fein = 0;
-static int TeileAdaptSchwelle(void)
+#define PARTS_ADAPT_THRESHOLD 50
+static int g_parts_adapt_fine = 0;
+static void PartsAdaptField(void)
 {
-  static int v = -1;
-  if (v < 0) {
-    v = 50;
-  }
-  return v;
-}
-static void TeileAdaptFeld(void)
-{
-  static unsigned int lm_vor = 0;
-  const int schw = TeileAdaptSchwelle();
+  static unsigned int lm_prev = 0;
   const unsigned int lm = SH2DynGetLoopskip(MSH2);
-  g_teile_adapt_fein = (schw > 0 && yabsys.IsSSH2Running && (lm - lm_vor) >= (unsigned)schw) ? 1 : 0;
-  lm_vor = lm;
+  g_parts_adapt_fine = (yabsys.IsSSH2Running && (lm - lm_prev) >= PARTS_ADAPT_THRESHOLD) ? 1 : 0;
+  lm_prev = lm;
 }
-static unsigned int g_db_sek_dicht = 0;   /* a field in the current second had >= threshold doorbells */
+static unsigned int g_db_sec_dense = 0;   /* a field in the current second had >= threshold doorbells */
 static unsigned int g_db_ring = 0;        /* bit i = second -i was dense (10 bits) */
-static unsigned int g_db_sek_felder = 0;
-static int DbDichteSchwelle(void)
-{
-  static int v = -1;
-  if (v < 0) {
-    v = 150;
-  }
-  return v;
-}
-static int DbDichteAnteil(void)
-{
-  static int v = -1;
-  if (v < 0) {
-    v = 8;
-  }
-  return v;
-}
-static int DbDichteTeile(void)
-{
-  static int v = -1;
-  if (v < 0) {
-    v = 10;
-  }
-  return v;
-}
-int g_perline_teile = 2;   /* SH2Exec slices per line in the per-line path */
+static unsigned int g_db_sec_fields = 0;
+int g_perline_parts = 2;   /* SH2Exec slices per line in the per-line path */
 
 
 int YabauseEmulate(void) {
@@ -835,7 +798,6 @@ int YabauseEmulate(void) {
       cpu_emutime += (YabauseGetTicks() - current_cpu_clock) * 1000000 / yabsys.tickfreq;
 #endif
        yabsys.DecilineCount++;
-       //Vdp2UpdateHv(yabsys.DecilineCount,yabsys.LineCount);
 
        {
        int line_boundary = 0;
@@ -847,14 +809,14 @@ int YabauseEmulate(void) {
          const u32 part2 = sh2cycles - part1;        /* deciline 10     */
 
          /* After an FRT doorbell, 263 lines use at least 3 slices. */
-         int teile_ = g_perline_teile;
-         if (g_db_fein > 0) { if (teile_ < 3 && Dbf3Stueckelung()) teile_ = 3; g_db_fein--; }
-         if (g_db_fein_an && teile_ < DbDichteTeile()) teile_ = DbDichteTeile();
-         if (g_teile_adapt_fein && teile_ < 3) teile_ = 3;
-         if (teile_ > 2) {
+         int parts_ = g_perline_parts;
+         if (g_db_fine > 0) { if (parts_ < 3) parts_ = 3; g_db_fine--; }
+         if (g_db_fine_on && parts_ < DB_DENSITY_PARTS) parts_ = DB_DENSITY_PARTS;
+         if (g_parts_adapt_fine && parts_ < 3) parts_ = 3;
+         if (parts_ > 2) {
             /* Split part1 into (N-1) slices so that the SH2 sees interrupts in between;
                the event order is unchanged. */
-            const u32 n_ = (u32)teile_ - 1u;
+            const u32 n_ = (u32)parts_ - 1u;
             const u32 st_ = part1 / n_;
             u32 k_;
             for (k_ = 0; k_ < n_; k_++) {
@@ -936,17 +898,16 @@ int YabauseEmulate(void) {
          else if (yabsys.LineCount == yabsys.MaxLineCount)
          {
             /* Account this field's doorbells for the per-second statistics. */
-            if (DbDichteSchwelle() > 0 && g_db_feld_n >= (unsigned)DbDichteSchwelle())
-               g_db_sek_dicht = 1;
-            TeileAdaptFeld();
-            g_db_feld_n = 0;
-            if (++g_db_sek_felder >= 60) {
+            if (g_db_field_n >= DB_DENSITY_THRESHOLD)
+               g_db_sec_dense = 1;
+            PartsAdaptField();
+            g_db_field_n = 0;
+            if (++g_db_sec_fields >= 60) {
                /* close the second: shift the ring, re-decide fine slicing */
-               g_db_ring = ((g_db_ring << 1) | g_db_sek_dicht) & 0x3FFu;
-               g_db_sek_dicht = 0;
-               if (DbDichteSchwelle() > 0)
-                  g_db_fein_an = (__builtin_popcount(g_db_ring) >= DbDichteAnteil()) ? 1u : 0u;
-               g_db_sek_felder = 0;
+               g_db_ring = ((g_db_ring << 1) | g_db_sec_dense) & 0x3FFu;
+               g_db_sec_dense = 0;
+               g_db_fine_on = (__builtin_popcount(g_db_ring) >= DB_DENSITY_SHARE) ? 1u : 0u;
+               g_db_sec_fields = 0;
             }
             // VBlankOUT
             PROFILE_START("VDP1/VDP2");
@@ -1136,14 +1097,6 @@ void YabauseStartSlave(void) {
    }
 
 
-   /* Debug option: do not start the second SH2 (disabled). */
-   {
-      static int noslave = -1;
-      if (noslave < 0) noslave = 0;   /* fixed off */
-      if (noslave) {
-         return;
-      }
-   }
    yabsys.IsSSH2Running = 1;
 }
 

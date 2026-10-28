@@ -222,7 +222,7 @@ void YabAddEventQueue( YabEventQueue * queue_t, int evcode ){
 
 /* Like YabAddEventQueue, but without waiting. If the queue is full the entry
    is dropped and 0 is returned. See threads.h for the restrictions. */
-int YabAddEventQueueNichtBlockend( YabEventQueue * queue_t, int evcode ){
+int YabAddEventQueueNonBlocking( YabEventQueue * queue_t, int evcode ){
     YabEventQueue_pthread * queue = (YabEventQueue_pthread*)queue_t;
     pthread_mutex_lock(&(queue->mutex));
     if (queue->size == queue->capacity) {
@@ -342,10 +342,10 @@ void YabThreadSetCurrentThreadAffinityMask(int mask)
 //...
 /* Raw-mask variant of YabThreadSetCurrentThreadAffinityMask() (which takes an
    index and can only express a single core), so a thread can get several cores. */
-extern "C" void YabThreadSetAffinityRoh(unsigned int maske)
+extern "C" void YabThreadSetAffinityRaw(unsigned int mask_val)
 {
 #if defined(__XU4__) || defined(IOS) || defined(__JETSON__)
-	(void)maske; return;
+	(void)mask_val; return;
 #else
 	#if !defined(ANDROID)
 		#ifdef SYS_gettid
@@ -353,24 +353,13 @@ extern "C" void YabThreadSetAffinityRoh(unsigned int maske)
 		#else
 		    pid_t pid = gettid();
 		#endif
-		syscall(__NR_sched_setaffinity, pid, sizeof(maske), &maske);
+		syscall(__NR_sched_setaffinity, pid, sizeof(mask_val), &mask_val);
 	#else
-		(void)maske;
+		(void)mask_val;
 	#endif
 #endif
 }
 
-/* 0 = emulation on core 0, 1 = emulation on core 2, 2 = emulation unbound.
-   From mode 1 on, the pinning syscall is skipped in the render loops. */
-extern "C" int YabaKernModus(void)
-{
-  static int m = -1;
-  /* Default is 2 (unbound): pinning the emulation thread to core 2 costs frame
-     rate on titles where the RBG0 rotation thread runs on a neighbouring core;
-     the scheduler avoids the core collision by itself. */
-  if (m < 0) m = 2;   /* fixed: unbound */
-  return m;
-}
 
 int getCpuId() {
 #if 0

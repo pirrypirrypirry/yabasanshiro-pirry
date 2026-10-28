@@ -23,8 +23,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <dirent.h>
 
 extern "C" { void ScspSetCddaVolume(int v); void ScspSetSfxVolume(int v); }
-extern "C" { extern int g_scsp_dspaus; }       /* scsp.c */
-extern "C" { extern int g_interhalb_menue; }   /* vidogl.c */
+extern "C" { extern int g_scsp_dsp_off; }       /* scsp.c */
+extern "C" { extern int g_interlace_half_menu; }   /* vidogl.c */
 #include <exception>
 #include <functional>
 #include <string>
@@ -65,6 +65,7 @@ extern "C" {
 #include "sh2int.h"
 #include "cdbase.h"
 #include "cs2.h"
+#include "cheat.h"
 #include "debug.h"
 #include "sndal.h"
 #include "sndsdl.h"
@@ -76,7 +77,7 @@ extern "C" {
 
 #include "InputManager.h"
 #include "MenuScreen.h"
-extern "C" void SmpcSetSystemsprache(int id);   /* smpc.c */
+extern "C" void SmpcSetSystemLanguage(int id);   /* smpc.c */
 #include "Preference.h"
 #include "RetroAchievements.h"
 
@@ -96,6 +97,15 @@ static char cartpath[256] = "\0";
 static bool menu_show = false;
 
 #define LOG(...) do { } while (0)
+
+/* a cheat of the loaded .cht is switched on */
+static bool cheats_on() {
+  int count = 0;
+  cheatlist_struct *list = CheatGetList(&count);
+  for (int i = 0; list != NULL && i < count; i++)
+    if (list[i].enable) return true;
+  return false;
+}
 
 M68K_struct * M68KCoreList[] = {
   &M68KDummy,
@@ -169,7 +179,7 @@ static SDL_GLContext glc;
    does not reliably tear down the Mali/EGL context; the next start could then
    come up with a stale graphics state (frozen picture while the emulation
    keeps running). Order: context, window, SDL. */
-static void GlSauberBeenden(void)
+static void GlCleanShutdown(void)
 {
   static int done = 0;
   if (done) return;
@@ -239,26 +249,26 @@ int saveScreenshot( const char * filename );
 int padmode = 0;
 
 /* Search for a Saturn BIOS image next to the game and in /roms/bios and
-   /roms2/bios. Returns 1 and stores the path in ziel when one is found. */
-static int BiosSuchen(const char *spiel, char *ziel, size_t zlen)
+   /roms2/bios. Returns 1 and stores the path in goal when one is found. */
+static int BiosFind(const char *game_path, char *goal, size_t goal_len)
 {
-  std::vector<std::string> ordner;
-  if (spiel != NULL && spiel[0] == '/') {
-    std::string sp(spiel);
+  std::vector<std::string> dir_path;
+  if (game_path != NULL && game_path[0] == '/') {
+    std::string sp(game_path);
     size_t p1 = sp.find('/', 1);                       /* /roms2/saturn/x.chd -> /roms2 */
-    if (p1 != std::string::npos) ordner.push_back(sp.substr(0, p1) + "/bios");
+    if (p1 != std::string::npos) dir_path.push_back(sp.substr(0, p1) + "/bios");
   }
-  ordner.push_back("/roms/bios");
-  ordner.push_back("/roms2/bios");
-  const char *namen[] = { "saturn_bios.bin", "sega_101.bin", "mpr-17933.bin", "sega1003.bin", NULL };
-  for (size_t o = 0; o < ordner.size(); o++)
-    for (int n = 0; namen[n] != NULL; n++) {
-      std::string k = ordner[o] + "/" + namen[n];
+  dir_path.push_back("/roms/bios");
+  dir_path.push_back("/roms2/bios");
+  const char *names[] = { "saturn_bios.bin", "sega_101.bin", "mpr-17933.bin", "sega1003.bin", NULL };
+  for (size_t o = 0; o < dir_path.size(); o++)
+    for (int n = 0; names[n] != NULL; n++) {
+      std::string k = dir_path[o] + "/" + names[n];
       FILE *f = fopen(k.c_str(), "rb");
-      if (f != NULL) { fclose(f); snprintf(ziel, zlen, "%s", k.c_str()); return 1; }
+      if (f != NULL) { fclose(f); snprintf(goal, goal_len, "%s", k.c_str()); return 1; }
     }
-  for (size_t o = 0; o < ordner.size(); o++) {
-    DIR *d = opendir(ordner[o].c_str());
+  for (size_t o = 0; o < dir_path.size(); o++) {
+    DIR *d = opendir(dir_path[o].c_str());
     if (d == NULL) continue;
     struct dirent *e;
     for (;;) {
@@ -267,10 +277,10 @@ static int BiosSuchen(const char *spiel, char *ziel, size_t zlen)
       std::string nm(e->d_name), kl(nm);
       std::transform(kl.begin(), kl.end(), kl.begin(), ::tolower);
       if (kl.find("saturn") == std::string::npos && kl.find("sega") == std::string::npos && kl.find("mpr-1") == std::string::npos) continue;
-      std::string k = ordner[o] + "/" + nm;
+      std::string k = dir_path[o] + "/" + nm;
       struct stat sb;
       if (stat(k.c_str(), &sb) == 0 && S_ISREG(sb.st_mode) && sb.st_size == 524288) {
-        closedir(d); snprintf(ziel, zlen, "%s", k.c_str()); return 1;
+        closedir(d); snprintf(goal, goal_len, "%s", k.c_str()); return 1;
       }
     }
     closedir(d);
@@ -330,12 +340,12 @@ int yabauseinit()
 #else
   yinit.polygon_generation_mode = PERSPECTIVE_CORRECTION;
 #endif
-  /* Sound: new SCSP core. Its DSP is enabled by the "sound dsp" config key
-     (default off). */
+  /* Sound: new SCSP core. Its DSP is enabled by the "sound dsp" key in the
+     global default.config (default on); per-game entries are ignored. */
   yinit.use_new_scsp = 1;
-  g_scsp_dspaus = pre.getInt("sound dsp", 0) ? 0 : 1;
+  g_scsp_dsp_off = pre.getIntOnlyGlobal("sound dsp", 1) ? 0 : 1;
   /* Half-height interlaced backgrounds, "interlace half" config key (default off). */
-  g_interhalb_menue = pre.getInt("interlace half", 0) ? 1 : 0;
+  g_interlace_half_menu = pre.getInt("interlace half", 0) ? 1 : 0;
   yinit.resolution_mode = pre.getInt( "Resolution" ,g_resolution_mode);
   yinit.rotate_screen = pre.getBool( "Rotate screen" , false );
   yinit.scsp_sync_count_per_frame = g_scsp_sync;
@@ -377,6 +387,50 @@ int yabauseinit()
   }
 
   res = YabauseInit(&yinit);
+  { /* Cheats for the game from ~/.yabasanshiro/cheats/*.cht (libretro format, Action Replay codes).
+       Names are compared without bracket tags and punctuation ("Burning Rangers (Europe).chd" ~
+       "Burning Rangers (USA).cht"); the same region is preferred, files in the RetroArch save format
+       ("(RetroArch)") come last. Entries picked in the menu are stored in the game config as
+       "cheat <N>"; otherwise an entry is on only if the file says enable = true. */
+    auto key = [](std::string n) {
+      std::string::size_type p = n.find_last_of('/');
+      if (p != std::string::npos) n = n.substr(p + 1);
+      p = n.find_first_of("([");
+      if (p != std::string::npos) n = n.substr(0, p);
+      p = n.find_last_of('.');
+      if (p != std::string::npos && n.size() - p <= 4) n = n.substr(0, p);
+      std::string k;
+      for (char c : n) if (isalnum((unsigned char)c)) k += (char)tolower((unsigned char)c);
+      return k;
+    };
+    std::string game(cdpath), dir = std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.yabasanshiro/cheats/";
+    std::string gk = key(game), best;
+    int bestscore = -100;
+    const char *regions[] = { "Europe", "USA", "Japan" };
+    if (DIR *d = opendir(dir.c_str())) {
+      while (struct dirent *e = readdir(d)) {
+        std::string f(e->d_name);
+        if (f.size() < 5 || f.compare(f.size() - 4, 4, ".cht") != 0 || key(f) != gk) continue;
+        int s = 0;
+        for (const char *r : regions)
+          if (game.find(r) != std::string::npos && f.find(r) != std::string::npos) s += 2;
+        if (f.find("(RetroArch)") != std::string::npos) s -= 3;
+        if (s > bestscore) { bestscore = s; best = f; }
+      }
+      closedir(d);
+    }
+    if (!best.empty()) {
+      int count = 0, last = -2;
+      CheatLoadCht((dir + best).c_str());
+      cheatlist_struct *list = CheatGetList(&count);
+      for (int i = 0; list != NULL && i < count; i++) {
+        int g = list[i].group;
+        if (g < 0 || g == last) continue;
+        last = g;
+        CheatEnableGroup(g, pre.getBool("cheat " + std::to_string(g), list[i].enable != 0) ? 1 : 0);
+      }
+    }
+  }
   {
     /* FPS overlay: "Show Fps" (fallback "show fps") from the game config or
        default.config, off otherwise. */
@@ -386,7 +440,7 @@ int yabauseinit()
     /* System language from the game config or default.config, English otherwise. */
     int sp = pre.getIntGlobal("system language", 0);
     if (sp < 0 || sp > 5) sp = 0;
-    SmpcSetSystemsprache(sp);
+    SmpcSetSystemLanguage(sp);
   }
   if( res == -1) {
     return -1;
@@ -396,8 +450,8 @@ int yabauseinit()
      game draws, because enabling it during boot breaks some titles. Must come
      after YabauseInit(), which resets the deciline mode. */
   {
-    extern int g_perline_gewuenscht;
-    g_perline_gewuenscht = 1;
+    extern int g_perline_requested;
+    g_perline_requested = 1;
     YabauseSetDecilineMode(1);
   }
 
@@ -491,10 +545,10 @@ int main(int argc, char** argv)
     FILE *bt_ = fopen(biospath, "rb");
     if (bt_ != NULL) fclose(bt_);
     else {
-      char gef_[256];
-      if (BiosSuchen(cdpath, gef_, sizeof(gef_))) {
-        printf("BIOS %s not found, using %s\n", biospath, gef_);
-        snprintf(biospath, sizeof(biospath), "%s", gef_);
+      char found_[256];
+      if (BiosFind(cdpath, found_, sizeof(found_))) {
+        printf("BIOS %s not found, using %s\n", biospath, found_);
+        snprintf(biospath, sizeof(biospath), "%s", found_);
       } else {
         printf("BIOS %s not found and no other BIOS image available, using HLE BIOS\n", biospath);
         g_emulated_bios = 1;
@@ -506,17 +560,17 @@ int main(int argc, char** argv)
   /* .m3u playlist (multi-disc games): load the first disc. "Next Disc" in
      the menu switches to the following ones. */
   {
-    std::string pfad(cdpath);
-    std::string klein = pfad;
-    std::transform(klein.begin(), klein.end(), klein.begin(), ::tolower);
-    if (klein.size() > 4 && klein.compare(klein.size() - 4, 4, ".m3u") == 0) {
+    std::string path_str(cdpath);
+    std::string lower_name = path_str;
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+    if (lower_name.size() > 4 && lower_name.compare(lower_name.size() - 4, 4, ".m3u") == 0) {
       FILE *fm = fopen(cdpath, "r");
       if (fm != NULL) {
-        char zeile[512];
-        std::string erste;
+        char line_buf[512];
+        std::string first_name;
         for (;;) {
-          if (fgets(zeile, sizeof(zeile), fm) == NULL) break;
-          std::string z(zeile);
+          if (fgets(line_buf, sizeof(line_buf), fm) == NULL) break;
+          std::string z(line_buf);
           if (z.size() >= 3 && (unsigned char)z[0] == 0xEF && (unsigned char)z[1] == 0xBB && (unsigned char)z[2] == 0xBF) z = z.substr(3);
           size_t e0 = z.find_last_not_of(" \t\r\n");
           if (e0 == std::string::npos) continue;
@@ -524,17 +578,17 @@ int main(int argc, char** argv)
           size_t a0 = z.find_first_not_of(" \t");
           z = z.substr(a0);
           if (z[0] == '#') continue;
-          erste = z;
+          first_name = z;
           break;
         }
         fclose(fm);
-        if (!erste.empty()) {
-          std::string ziel = erste;
-          if (ziel[0] != '/') {
-            size_t sl = pfad.find_last_of('/');
-            ziel = (sl == std::string::npos ? std::string("") : pfad.substr(0, sl + 1)) + erste;
+        if (!first_name.empty()) {
+          std::string goal = first_name;
+          if (goal[0] != '/') {
+            size_t sl = path_str.find_last_of('/');
+            goal = (sl == std::string::npos ? std::string("") : path_str.substr(0, sl + 1)) + first_name;
           }
-          strncpy(cdpath, ziel.c_str(), sizeof(cdpath) - 1);
+          strncpy(cdpath, goal.c_str(), sizeof(cdpath) - 1);
           cdpath[sizeof(cdpath) - 1] = 0;
         } else {
           fprintf(stderr, "%s contains no disc\n", cdpath);
@@ -632,25 +686,16 @@ int main(int argc, char** argv)
 
   /* Identify the disc for RetroAchievements (cdpath is final here). */
   RA_LoadGame();
+  if (cheats_on()) RA_CheatsUsed();
 
   p = new Preference(cdpath);
   VIDCore->Resize(0,0,width,height,1,p->getInt("Aspect rate",0));
   delete p;
   
   SDL_GL_MakeCurrent(wnd,nullptr);
-  /* Affinity of the thread that runs YabauseExec(), see YabaKernModus(). */
-  switch (YabaKernModus()) {
-  case 1:  YabThreadSetAffinityRoh(1u << 2); break;  /* core 2 */
-  case 2:  YabThreadSetAffinityRoh(0xFu);    break;  /* unbound */
-  case 3:  YabThreadSetAffinityRoh(0xFu);    break;  /* all threads unbound */
-  default:
-#if defined(__RP64__) || defined(__N2__)
-    YabThreadSetCurrentThreadAffinityMask(0x4);
-#else
-    YabThreadSetCurrentThreadAffinityMask(0x0);
-#endif
-    break;
-  }
+  /* The thread that runs YabauseExec() is not pinned: pinning it to core 2 costs frame rate in titles whose RBG0
+     rotation thread runs on a neighbouring core, and the scheduler avoids the collision by itself. */
+  YabThreadSetAffinityRaw(0xFu);
   Uint32 evToggleMenu = SDL_RegisterEvents(1);
   inputmng->setToggleMenuEventCode(evToggleMenu);
 
@@ -706,7 +751,7 @@ int main(int argc, char** argv)
         }
         RA_Shutdown();
         YabauseDeInit();
-        GlSauberBeenden();
+        GlCleanShutdown();
         return 0;
       }
       else if( e.type == evUpdateConfig ){
@@ -754,7 +799,7 @@ int main(int argc, char** argv)
 
       else if(e.type == evResetMenu){
         YabauseReset();
-        RA_OnReset();
+        RA_OnReset(cheats_on());
         hideMenuScreen(); 
       }
 
@@ -877,7 +922,7 @@ int main(int argc, char** argv)
   }
   RA_Shutdown();
   YabauseDeInit();
-  GlSauberBeenden();
+  GlCleanShutdown();
   return 0;
 }
 

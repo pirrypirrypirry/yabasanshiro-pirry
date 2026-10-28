@@ -187,9 +187,9 @@ void new_scsp_exec(s32 cycles);
 void ScspLockThread();
 void ScspUnLockThread();
 /* Defined in scsp.c, set by sndsdl.c (stretch path only); NULL = no-op. Values are in frames.
-   g_ladeton_pause: was=1 pauses (returns 1 if paused, *fuell = fill level), was=0 resumes and refills if the level is
-   below target (returns 1 if refilled), was=-1 only resumes. */
-extern int (*g_ladeton_pause)(int was, unsigned int *fuell, unsigned int *aufgefuellt, unsigned int *ziel);
+   g_loadsnd_pause: action=1 pauses (returns 1 if paused, *fill_amount = fill level), action=0 resumes and refills if the level is
+   below target (returns 1 if refilled), action=-1 only resumes. */
+extern int (*g_loadsnd_pause)(int action, unsigned int *fill_amount, unsigned int *filled_up, unsigned int *goal);
 void setM68kCounter(u64 counter);
 void setM68kDoneCounter(u64 counter);
 
@@ -197,7 +197,7 @@ extern int use_new_scsp;
 
 /* Mute or unmute CD audio at runtime (menu toggle). Must be declared inside
    the extern "C" block so the C++ caller links against the C symbol. */
-void ScspSetCddaMute(int an);
+void ScspSetCddaMute(int on_val);
 
 #if defined (__cplusplus)
 }

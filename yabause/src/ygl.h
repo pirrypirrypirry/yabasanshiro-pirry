@@ -476,7 +476,7 @@ typedef struct {
   GLuint mtxModelView;
   GLuint mtxTexture;
   GLuint tex0;
-  GLint  farbmaske;   /* location of u_farbmaske plus 1 (0 = missing / never filled) */
+  GLint  color_mask;   /* location of u_colormask plus 1 (0 = missing / never filled) */
 } YglVdp1CommonParam;
 
 #define TESS_COUNT (8)
@@ -784,8 +784,8 @@ int YglQuadRbg0(vdp2draw_struct * input, YglTexture * output, YglCache * c, YglC
 void YglQuadOffset(vdp2draw_struct * input, YglTexture * output, YglCache * c, int cx, int cy, float sx, float sy);
 void YglCachedQuadOffset(vdp2draw_struct * input, YglCache * cache, int cx, int cy, float sx, float sy);
 /* Tile path with a per-level program memo (ygles.c) */
-void YglKachelEbeneBeginn(void);
-void YglKachelQuad(vdp2draw_struct *input, YglTexture *output, YglCache *c, int cx, int cy, float sx, float sy, int cash_flg, int modus);
+void YglTileLayerBegin(void);
+void YglTileQuad(vdp2draw_struct *input, YglTexture *output, YglCache *c, int cx, int cy, float sx, float sy, int cash_flg, int mode_val);
 void YglCachedQuad(vdp2draw_struct *, YglCache *);
 int YglQuadSlot(vdp2draw_struct *input, YglTexture *output, YglCache *c, u64 key);
 void YglRender(void);

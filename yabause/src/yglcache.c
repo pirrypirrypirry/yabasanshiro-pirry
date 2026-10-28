@@ -50,7 +50,7 @@ int g_texcache_persist = 0;
 /* Bumped whenever SPCTL or CCCTL change (see ygl.h); cached VDP1 textures
    from an older generation are not reused. */
 u32 g_vdp1_decode_gen = 1;
-int g_decodegen_an = 1;
+int g_decodegen_on = 1;
 
 static __thread u32 s_src_addr = 0, s_src_len = 0, s_src_addr2 = 0, s_src_len2 = 0;
 static __thread u32 s_src_gen = 0;
@@ -131,12 +131,12 @@ static int YglIsCached_in(YglTextureManager * tm, u64 addr, YglCache * c) {
 
   hashkey = YglgetHash(addr);  /* get hash */
 
-  YglCacheHash *kopf = __atomic_load_n(&tm->HashTable[hashkey], __ATOMIC_ACQUIRE);
-  if (kopf == NULL) {  /* Empty Hash */
+  YglCacheHash *head_val = __atomic_load_n(&tm->HashTable[hashkey], __ATOMIC_ACQUIRE);
+  if (head_val == NULL) {  /* Empty Hash */
     return 0;        /* Not Found */
   }
   else {  /* needs liner search */
-	  YglCacheHash *at = kopf;
+	  YglCacheHash *at = head_val;
     while (at != NULL) {
       if (at->addr == addr) {  /* Find! */
         /* The VDP1 and VDP2 key spaces overlap (VDP1: CMDSRCA<<48|CMDCOLR<<32|
@@ -158,7 +158,7 @@ static int YglIsCached_in(YglTextureManager * tm, u64 addr, YglCache * c) {
           }
           /* Priority/color calculation index are baked into the texels and
              depend on SPCTL/CCCTL. */
-          if (g_decodegen_an && at->unit == YGL_TEXSRC_VDP1 &&
+          if (g_decodegen_on && at->unit == YGL_TEXSRC_VDP1 &&
               at->decode_gen != g_vdp1_decode_gen) {
             return 0;
           }

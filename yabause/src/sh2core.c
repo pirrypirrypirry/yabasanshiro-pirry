@@ -64,16 +64,11 @@ u8 SCIReceiveByte(void);
 void SCITransmitByte(u8);
 
 void DMATransferCycles(Dmac * dmac, int cycles);
-static int tefix_an(void);
 int DMAProc( int cycles );
 /* If the CPU reads CHCRx while the channel is running (DE=1, TE=0), the DMA is
    completed at that point, so that a program polling TE does not wait until the
    end of the time slice. */
-static int DmaPollAn(void)
-{
-   return 1;   /* fixed on */
-}
-static void DmaPollTreiben(u32 chcr)
+static void DmaPollDrive(u32 chcr)
 {
    if ((chcr & 3) != 1) return;   /* only DE=1 and TE=0 */
    DMAProc(0x7FFFFFFF);
@@ -1364,7 +1359,7 @@ u32 FASTCALL OnchipReadLong(u32 addr) {
       case 0x188:
          return CurrentSH2->onchip.TCR0;
       case 0x18C:
-         if (DmaPollAn()) DmaPollTreiben(CurrentSH2->onchip.CHCR0);
+         DmaPollDrive(CurrentSH2->onchip.CHCR0);
          CurrentSH2->onchip.CHCR0M = 0;
          return CurrentSH2->onchip.CHCR0;
       case 0x190:
@@ -1374,7 +1369,7 @@ u32 FASTCALL OnchipReadLong(u32 addr) {
       case 0x198:
          return CurrentSH2->onchip.TCR1;
       case 0x19C:
-         if (DmaPollAn()) DmaPollTreiben(CurrentSH2->onchip.CHCR1);
+         DmaPollDrive(CurrentSH2->onchip.CHCR1);
           CurrentSH2->onchip.CHCR1M = 0;
          return CurrentSH2->onchip.CHCR1;
       case 0x1A0:
@@ -1470,7 +1465,7 @@ void FASTCALL OnchipWriteByte(u32 addr, u8 val) {
                SH2SendInterrupt(CurrentSH2, (CurrentSH2->onchip.VCRC >> 8) & 0x7F, (CurrentSH2->onchip.IPRB >> 8) & 0xF);
          } else if (!(CurrentSH2->onchip.FTCSR & 0x80)) {
             // ICF retired with an empty bank: the next ICF must come from a
-            // genuinely new edge.
+            // new edge.
             CurrentSH2->frtIcIntOwed = 0;
          }
 /*
@@ -1820,8 +1815,28 @@ void FASTCALL OnchipWriteLong(u32 addr, u32 val)  {
          {
             s64 quotient = dividend / divisor;
             s32 remainder = dividend % divisor;
+            /* Edge cases (Ymir): +2^31 with negative divisor and zero remainder is valid
+               (0x80000000); quotients in [-2^32, -2^31-1], and -2^31 with a negative
+               divisor, overflow. */
+            int div_edge = 0;
+            if (quotient == 0x80000000LL && divisor < 0 && remainder == 0) div_edge = 1;
+            else if (quotient < -0x80000000LL && (s32)(quotient >> 32) >= -1) div_edge = 2;
+            else if (quotient == -0x80000000LL && divisor < 0) div_edge = 2;
 
-            if (quotient > 0x7FFFFFFF)
+            if (div_edge == 1)
+            {
+               CurrentSH2->onchip.DVDNTL = 0x80000000;
+               CurrentSH2->onchip.DVDNTH = remainder;
+            }
+            else if (div_edge == 2)
+            {
+               CurrentSH2->onchip.DVCR |= 1;
+               CurrentSH2->onchip.DVDNTL = 0x80000000;
+               CurrentSH2->onchip.DVDNTH = 0xFFFFFFFE; // same as the < -1 branch below
+               if (CurrentSH2->onchip.DVCR & 0x2)
+                  SH2SendInterrupt(CurrentSH2, CurrentSH2->onchip.VCRDIV & 0x7F, (CurrentSH2->onchip.IPRA >> 12) & 0xF);
+            }
+            else if (quotient > 0x7FFFFFFF)
             {
                CurrentSH2->onchip.DVCR |= 1;
                CurrentSH2->onchip.DVDNTL = 0x7FFFFFFF;
@@ -1878,16 +1893,16 @@ void FASTCALL OnchipWriteLong(u32 addr, u32 val)  {
           DMAProc(0x7FFFFFFF);
         }
          {
-           u32 te_alt = CurrentSH2->onchip.CHCR0;   /* remember the old value */
+           u32 te_old = CurrentSH2->onchip.CHCR0;   /* remember the old value */
            CurrentSH2->onchip.CHCR0 = val & 0xFFFF;
-           if (tefix_an()) CurrentSH2->onchip.CHCR0 = (val & ~2) | (te_alt & (val | CurrentSH2->onchip.CHCR0M) & 2);
-           else CurrentSH2->onchip.CHCR0 = (val & ~2) | (CurrentSH2->onchip.CHCR0 & (val| CurrentSH2->onchip.CHCR0M) & 2);
+           /* TE is cleared only if TE=1 was read before, so the old value counts */
+           CurrentSH2->onchip.CHCR0 = (val & ~2) | (te_old & (val | CurrentSH2->onchip.CHCR0M) & 2);
          }
 
          // If the DMAOR DME bit is set and AE and NMIF bits are cleared,
          // and CHCR's DE bit is set and TE bit is cleared,
          // do a dma transfer
-         if ((CurrentSH2->onchip.DMAOR & 7) == 1 && ((tefix_an() ? CurrentSH2->onchip.CHCR0 : val) & 0x3) == 1) {
+         if ((CurrentSH2->onchip.DMAOR & 7) == 1 && (CurrentSH2->onchip.CHCR0 & 0x3) == 1) {
 
            CurrentSH2->dma_ch0.copy_clock = 0;
 
@@ -1915,10 +1930,10 @@ void FASTCALL OnchipWriteLong(u32 addr, u32 val)  {
           DMAProc(0x7FFFFFFF);
         }
          {
-           u32 te_alt = CurrentSH2->onchip.CHCR1;   /* remember the old value */
+           u32 te_old = CurrentSH2->onchip.CHCR1;   /* remember the old value */
            CurrentSH2->onchip.CHCR1 = val & 0xFFFF;
-           if (tefix_an()) CurrentSH2->onchip.CHCR1 = (val & ~2) | (te_alt & (val | CurrentSH2->onchip.CHCR1M) & 2);
-           else CurrentSH2->onchip.CHCR1 = (val & ~2) | (CurrentSH2->onchip.CHCR1 & (val| CurrentSH2->onchip.CHCR1M) & 2);
+           /* TE is cleared only if TE=1 was read before, so the old value counts */
+           CurrentSH2->onchip.CHCR1 = (val & ~2) | (te_old & (val | CurrentSH2->onchip.CHCR1M) & 2);
          }
 
          // If the DMAOR DME bit is set and AE and NMIF bits are cleared,
@@ -2157,7 +2172,8 @@ void WDTExec(u32 cycles) {
    u32 wdttemp;
    u32 mask;
 
-   if (!CurrentSH2->wdt.isenable || CurrentSH2->onchip.WTCSR & 0x80 || CurrentSH2->onchip.RSTCSR & 0x80)
+   /* keeps counting while WTCSR.OVF is set (Ymir, Mednafen) */
+   if (!CurrentSH2->wdt.isenable || CurrentSH2->onchip.RSTCSR & 0x80)
       return;
 
    wdttemp = (u32)CurrentSH2->onchip.WTCNT;
@@ -2255,16 +2271,12 @@ int DMAProc(int cycles) {
 }
 #else
 /* DMAOR.DME (bit 0) = 0 halts all channels on the hardware (SH7604 manual). */
-static int DmeFixAn(void)
-{
-  return 1;   /* fixed on */
-}
 int DMAProc( int cycles ){
 
 
    if (CurrentSH2->onchip.DMAOR & 0x6)
       return 0;
-   if (!(CurrentSH2->onchip.DMAOR & 0x1) && DmeFixAn())
+   if (!(CurrentSH2->onchip.DMAOR & 0x1))
       return 0;
 
    
@@ -2399,12 +2411,6 @@ int getEatClock(u32 src, u32 dst) {
 
 }
 
-/* On hardware, a CHCR write clears TE only if the program has read TE=1 before.
-   The clear formula  (val & ~2) | (CHCRx & (val | CHCRxM) & 2)  therefore has
-   to use the old CHCR value, not the newly written one. */
-static int tefix_an(void) {
-  return 1;   /* fixed on */
-}
 
 
 void DMATransferCycles(Dmac * dmac, int cycles ){
@@ -2642,13 +2648,13 @@ void DMATransfer(u32 *CHCR, u32 *SAR, u32 *DAR, u32 *TCR, u32 *VCRDMA)
    after each doorbell the next 263 lines (~1 frame) run with 3 slices per line
    instead of 2, so that the other CPU does not see intermediate states of the
    sender too early. Without a doorbell the cost is one comparison per line. */
-#define DBF3_ZEILEN 263            /* ~1 NTSC frame */
-int g_db_fein = 0;                 /* remaining lines with 3 slices (yabause.c) */
-unsigned int g_db_feld_n = 0;      /* doorbells in the current field (reset at VBlankOUT in yabause.c) */
-static void DbFeinAusloesen(int von_master)
+#define DBF3_LINES 263            /* ~1 NTSC frame */
+int g_db_fine = 0;                 /* remaining lines with 3 slices (yabause.c) */
+unsigned int g_db_field_n = 0;      /* doorbells in the current field (reset at VBlankOUT in yabause.c) */
+static void DbFineTrigger(int von_master)
 {
-   g_db_feld_n++;
-   g_db_fein = DBF3_ZEILEN;
+   g_db_field_n++;
+   g_db_fine = DBF3_LINES;
 }
 
 /* Lower bound for the catch-up run after a doorbell. syncCycle compares
@@ -2657,13 +2663,13 @@ static void DbFeinAusloesen(int von_master)
    and the catch-up would almost never run. The target CPU then reacts only in
    its next slice, while the other CPU may reset and refill its command ring
    (ABA on read/write pointers), which deadlocks (Last Bronx). */
-static int IcfNachMin(void)
+static int IcfAfterMin(void)
 {
    return 256;   /* fixed lower bound */
 }
-static int IcfNachAnheben(int syncCycle, int ziel_slave)
+static int IcfAfterRaise(int syncCycle, int target_slave)
 {
-   const int m = IcfNachMin();
+   const int m = IcfAfterMin();
    if (m > 0 && syncCycle < m) {
       return m;
    }
@@ -2699,7 +2705,7 @@ static int SyncDistance(SH2_struct *target)
 
 void FASTCALL MSH2InputCaptureWriteWord(UNUSED u32 addr, UNUSED u16 data)
 {
-   DbFeinAusloesen(1);
+   DbFineTrigger(1);
    /* If this edge arrives while ICF is still set and a handler run is still
       pending, bank it instead of letting the next FTCSR clear swallow it.
       Gated on frtIcIntOwed rather than TIER.ICIE: an ICI handler typically
@@ -2735,7 +2741,7 @@ void FASTCALL MSH2InputCaptureWriteWord(UNUSED u32 addr, UNUSED u16 data)
       if (dyn)
          syncCycle = SyncDistance(MSH2);
       else
-         syncCycle = IcfNachAnheben((int)(CurrentSH2->cycles - MSH2->cycles), 0);
+         syncCycle = IcfAfterRaise((int)(CurrentSH2->cycles - MSH2->cycles), 0);
       if (syncCycle > 0) {
          SH2_struct * tmpCurrentSH2 = CurrentSH2;
          tmpCurrentSH2->depth++;
@@ -2766,7 +2772,7 @@ void FASTCALL MSH2InputCaptureWriteWord(UNUSED u32 addr, UNUSED u16 data)
 
 void FASTCALL SSH2InputCaptureWriteWord(UNUSED u32 addr, UNUSED u16 data)
 {
-   DbFeinAusloesen(0);
+   DbFineTrigger(0);
    /* Same bank logic as in MSH2InputCaptureWriteWord, for the other direction. */
    if ((SSH2->onchip.FTCSR & 0x80) && SSH2->frtIcIntOwed &&
        SSH2->frtIcMergedEdges < 8) {
@@ -2796,7 +2802,7 @@ void FASTCALL SSH2InputCaptureWriteWord(UNUSED u32 addr, UNUSED u16 data)
       if (dyn)
          syncCycle = SyncDistance(SSH2);
       else
-         syncCycle = IcfNachAnheben((int)(CurrentSH2->cycles - SSH2->cycles), 1);
+         syncCycle = IcfAfterRaise((int)(CurrentSH2->cycles - SSH2->cycles), 1);
       if (syncCycle > 0) {
          SH2_struct * tmpCurrentSH2 = CurrentSH2;
          tmpCurrentSH2->depth++;

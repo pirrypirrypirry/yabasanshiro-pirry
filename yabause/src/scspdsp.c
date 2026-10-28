@@ -151,14 +151,14 @@ static u16 INLINE int_to_float(u32 i_val)
 }
 
 
-/* One DSP step, inline; ring_maske = (0x2000 << rbl) - 1, rbp12 = rbp << 12 (constant per sample).
+/* One DSP step, inline; ring_mask = (0x2000 << rbl) - 1, rbp12 = rbp << 12 (constant per sample).
    Bit-exact with the former ScspDspExec. */
 /* The eleven values read and written by every step, kept local per sample (registers) instead of global. */
 struct dsp_reg {
   s32 inputs; s32 y_reg; u16 frc_reg; u16 adrs_reg; u32 shift_reg; s64 product;
   u32 read_value; u32 write_value; int read_pending; int write_pending; u32 io_addr;
 };
-static inline __attribute__((always_inline)) void dsp_reg_laden(struct dsp_reg* r, const ScspDsp* dsp)
+static inline __attribute__((always_inline)) void dsp_reg_load(struct dsp_reg* r, const ScspDsp* dsp)
 {
   r->inputs = dsp->inputs; r->y_reg = dsp->y_reg; r->frc_reg = dsp->frc_reg; r->adrs_reg = dsp->adrs_reg;
   r->shift_reg = dsp->shift_reg; r->product = dsp->product; r->read_value = dsp->read_value;
@@ -173,15 +173,15 @@ static inline __attribute__((always_inline)) void dsp_reg_sichern(ScspDsp* dsp, 
   dsp->io_addr = r->io_addr;
 }
 
-static inline __attribute__((always_inline)) void dsp_schritt(ScspDsp* dsp, struct dsp_reg* r, u64 befehl, u16* sound_ram_16,
-                                                              u32 mdec_ct, u32 ring_maske, u32 rbp12)
+static inline __attribute__((always_inline)) void dsp_step(ScspDsp* dsp, struct dsp_reg* r, u64 instr, u16* sound_ram_16,
+                                                              u32 mdec_ct, u32 ring_mask, u32 rbp12)
 {
   union ScspDspInstruction inst;
   s32 ShifterOutput;
   u32 SGAOutput;
-  u16 y_ein;
+  u16 y_in;
 
-  inst.all = befehl;
+  inst.all = instr;
 
   const unsigned TEMPWriteAddr = (inst.part.twa + mdec_ct) & 0x7F;
   const unsigned TEMPReadAddr = (inst.part.tra + mdec_ct) & 0x7F;
@@ -205,10 +205,10 @@ static inline __attribute__((always_inline)) void dsp_schritt(ScspDsp* dsp, stru
 
   /* Y and SGA read y_reg/shift_reg before they are updated further below */
   switch (inst.part.ysel) {
-    case 0:  y_ein = r->frc_reg; break;
-    case 1:  y_ein = dsp->coef[inst.part.coef]; break;
-    case 2:  y_ein = (u16)((r->y_reg >> 11) & 0x1FFF); break;
-    default: y_ein = (u16)((r->y_reg >> 4) & 0x0FFF); break;
+    case 0:  y_in = r->frc_reg; break;
+    case 1:  y_in = dsp->coef[inst.part.coef]; break;
+    case 2:  y_in = (u16)((r->y_reg >> 11) & 0x1FFF); break;
+    default: y_in = (u16)((r->y_reg >> 4) & 0x0FFF); break;
   }
   SGAOutput = inst.part.bsel ? r->shift_reg : (u32)TEMP;
 
@@ -236,7 +236,7 @@ static inline __attribute__((always_inline)) void dsp_schritt(ScspDsp* dsp, stru
   if (inst.part.frcl)
     r->frc_reg = (sh0 & sh1) ? (unsigned)(ShifterOutput & 0xFFF) : (unsigned)(ShifterOutput >> 11);
 
-  r->product = ((s64)sign_x_to_s32(13, y_ein) * X) >> 12;
+  r->product = ((s64)sign_x_to_s32(13, y_in) * X) >> 12;
 
   if (inst.part.negb)
     SGAOutput = -SGAOutput;
@@ -278,7 +278,7 @@ static inline __attribute__((always_inline)) void dsp_schritt(ScspDsp* dsp, stru
     if (!inst.part.table)
     {
       addr += mdec_ct;
-      addr &= ring_maske;
+      addr &= ring_mask;
     }
 
     r->io_addr = (addr + rbp12) & 0x3FFFF;
@@ -302,8 +302,8 @@ static inline __attribute__((always_inline)) void dsp_schritt(ScspDsp* dsp, stru
 void ScspDspExec(ScspDsp* dsp, int addr, u8 * sound_ram)
 {
   struct dsp_reg r;
-  dsp_reg_laden(&r, dsp);
-  dsp_schritt(dsp, &r, dsp->mpro[addr], (u16*)sound_ram, dsp->mdec_ct, (0x2000 << dsp->rbl) - 1, (u32)dsp->rbp << 12);
+  dsp_reg_load(&r, dsp);
+  dsp_step(dsp, &r, dsp->mpro[addr], (u16*)sound_ram, dsp->mdec_ct, (0x2000 << dsp->rbl) - 1, (u32)dsp->rbp << 12);
   dsp_reg_sichern(dsp, &r);
 }
 
@@ -319,7 +319,7 @@ static u8 s_np_idx[128];
 void ScspDspRunSample(ScspDsp* dsp, int n, u8 * sound_ram)
 {
   const u32 mdec_ct = dsp->mdec_ct;
-  const u32 ring_maske = (0x2000 << dsp->rbl) - 1;
+  const u32 ring_mask = (0x2000 << dsp->rbl) - 1;
   const u32 rbp12 = (u32)dsp->rbp << 12;
   u16* const ram16 = (u16*)sound_ram;
   int i, k;
@@ -334,9 +334,9 @@ void ScspDspRunSample(ScspDsp* dsp, int n, u8 * sound_ram)
   }
   {
     struct dsp_reg r;   /* load once, store once */
-    dsp_reg_laden(&r, dsp);
+    dsp_reg_load(&r, dsp);
     for (k = 0; k < s_np_cnt; k++)
-      dsp_schritt(dsp, &r, dsp->mpro[s_np_idx[k]], ram16, mdec_ct, ring_maske, rbp12);
+      dsp_step(dsp, &r, dsp->mpro[s_np_idx[k]], ram16, mdec_ct, ring_mask, rbp12);
     dsp_reg_sichern(dsp, &r);
   }
 }

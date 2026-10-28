@@ -32,9 +32,14 @@ public:
     int getInt( const string & key, int defaultv );
     /* Game config, else ~/.yabasanshiro/default.config (global), else defaultv. Creates no keys. */
     int getIntGlobal( const string & key, int defaultv );
+    /* ONLY ~/.yabasanshiro/default.config (the game config is not asked), else defaultv. Creates no keys. */
+    int getIntOnlyGlobal( const string & key, int defaultv );
+    /* Sets ONE key in default.config (read the file fresh, change only this key, write it back;
+       a missing file is created with just this key). */
+    void setIntGlobal( const string & key, int value );
     bool getBool( const string & key, bool defaultv );
     /* Save only on a real change (setInt/setBool). */
-    bool geaendert = false;
+    bool changed = false;
     /* String values, e.g. the configurable save state location ("state path").
        If the key is missing or has the wrong type the default is returned.
        Like getInt/getBool, the default is NOT written back to the file, so a
@@ -50,11 +55,11 @@ protected:
 
   /* Keys that were actually set during this run. Only these are written to
      the file; everything else stays as it is on disk. */
-  std::set<string> geaenderte_schluessel;
-  void schreibe_nur_geaenderte();
+  std::set<string> changed_keys;
+  void write_changed_only();
 
   /* Whether the config file existed at startup. */
-  bool gab_es_schon = false;
-  void lege_standard_an();
+  bool existed_before = false;
+  void create_defaults();
 
 };

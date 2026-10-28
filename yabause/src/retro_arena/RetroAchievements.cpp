@@ -20,13 +20,6 @@
 /*  RetroAchievements on top of rcheevos rc_client, see RetroAchievements.h */
 #include <algorithm>
 #include "RetroAchievements.h"
-#include "../instrument.h"
-/* Log lines for development builds only (YABA_INSTRUMENT); release builds print nothing. */
-#ifdef YABA_INSTRUMENT
-#define RA_LOG(...) fprintf(stderr, __VA_ARGS__)
-#else
-#define RA_LOG(...) ((void)0)
-#endif
 #include "../config.h"
 
 #include <dlfcn.h>
@@ -154,7 +147,10 @@ bool g_loading = false;                   /* load game request running */
 std::atomic<bool> g_logged_in(false);
 std::atomic<bool> g_game_loaded(false);
 std::atomic<bool> g_hc_pending(false);    /* hardcore selected, waits for reset */
+std::atomic<bool> g_cheats(false);        /* a cheat was on since the last reset */
 std::string g_user_agent;
+
+const char * const CHEATS_MSG = "Cheats activated -> RetroAchievements disabled until reset";
 
 CurlApi g_curl;
 bool g_curl_tried = false;   /* only touched by the main thread, before the worker starts */
@@ -429,7 +425,6 @@ void event_handler(const rc_client_event_t* ev, rc_client_t*) {
                ev->achievement->title ? ev->achievement->title : "?",
                (unsigned)ev->achievement->points);
       set_overlay(b);
-      RA_LOG("RetroAchievements: %s\n", b);
       update_game_status();
     }
     break;
@@ -441,7 +436,6 @@ void event_handler(const rc_client_event_t* ev, rc_client_t*) {
                ev->type == RC_CLIENT_EVENT_LEADERBOARD_STARTED ? "started" : "failed",
                ev->leaderboard->title ? ev->leaderboard->title : "?");
       set_overlay(b);
-      RA_LOG("RetroAchievements: %s\n", b);
     }
     break;
   case RC_CLIENT_EVENT_LEADERBOARD_SUBMITTED:
@@ -451,7 +445,6 @@ void event_handler(const rc_client_event_t* ev, rc_client_t*) {
                ev->leaderboard->title ? ev->leaderboard->title : "?",
                ev->leaderboard->tracker_value ? ev->leaderboard->tracker_value : "");
       set_overlay(b);
-      RA_LOG("RetroAchievements: %s\n", b);
     }
     break;
   case RC_CLIENT_EVENT_LEADERBOARD_TRACKER_SHOW:
@@ -498,7 +491,6 @@ void event_handler(const rc_client_event_t* ev, rc_client_t*) {
     RA_GetStatus(st);
     std::string m = std::string(rc_client_get_hardcore_enabled(g_client) ? "Mastered: " : "Completed: ") + st.game_title;
     set_overlay(m);
-    RA_LOG("RetroAchievements: %s\n", m.c_str());
     break;
   }
   case RC_CLIENT_EVENT_SERVER_ERROR:
@@ -507,8 +499,6 @@ void event_handler(const rc_client_event_t* ev, rc_client_t*) {
       snprintf(b, sizeof(b), "RetroAchievements error: %s",
                ev->server_error->error_message ? ev->server_error->error_message : "?");
       set_overlay(b);
-      RA_LOG("RetroAchievements: server error (%s): %s\n",
-              ev->server_error->api ? ev->server_error->api : "?", b);
     }
     break;
   case RC_CLIENT_EVENT_DISCONNECTED:
@@ -528,24 +518,24 @@ void load_game_cb(int result, const char* error_message, rc_client_t*, void*) {
   g_loading = false;
   update_game_status();
   if (result != RC_OK) {
-    RA_LOG("RetroAchievements: game not loaded: %s\n", error_message ? error_message : "?");
     return;
   }
   RAStatus st;
   RA_GetStatus(st);
   char b[256];
   /* the mode must be visible when the game starts */
-  snprintf(b, sizeof(b), "%s: %u/%u achievements - %s mode", st.game_title.c_str(), st.ach_unlocked, st.ach_total,
-           rc_client_get_hardcore_enabled(g_client) ? "Hardcore" : "Casual");
+  if (g_cheats.load())
+    snprintf(b, sizeof(b), "%s: cheats activated -> RetroAchievements disabled", st.game_title.c_str());
+  else
+    snprintf(b, sizeof(b), "%s: %u/%u achievements - %s mode", st.game_title.c_str(), st.ach_unlocked, st.ach_total,
+             rc_client_get_hardcore_enabled(g_client) ? "Hardcore" : "Casual");
   set_overlay(b);
-  RA_LOG("RetroAchievements: game loaded: %s\n", b);
 }
 
 void start_game_load() {
   if (!g_client || g_hash.empty() || g_loading || rc_client_is_game_loaded(g_client)) return;
   g_loading = true;
   clear_indicators();
-  RA_LOG("RetroAchievements: loading game, hash %s\n", g_hash.c_str());
   rc_client_begin_load_game(g_client, g_hash.c_str(), load_game_cb, NULL);
 }
 
@@ -676,6 +666,7 @@ void RA_GetStatus(RAStatus & st) {
   st.hardcore = g_cfg.hardcore != 0;
   st.indicators = g_cfg.indicators != 0;
   st.hardcore_active = eff;
+  st.cheats = g_cheats.load();
   if (st.state == RA_NOT_AVAILABLE) st.error = "libcurl not available";
 }
 
@@ -713,12 +704,8 @@ void RA_LoadGame() {
   if (g_logged_in.load()) start_game_load();   /* else the login callback does it */
 }
 
-void change_media_cb(int result, const char* error_message, rc_client_t*, void*) {
+void change_media_cb(int, const char*, rc_client_t*, void*) {
   update_game_status();
-  if (result != RC_OK)
-    RA_LOG("RetroAchievements: disc change: %s\n", error_message ? error_message : "?");
-  else
-    RA_LOG("RetroAchievements: disc change accepted\n");
 }
 
 /* After a disc swap: tell the server about the new disc of the running game instead of unloading it.
@@ -729,7 +716,6 @@ void RA_OnDiscChanged() {
   std::string hex;
   if (!disc_hash(hex) || hex == g_hash) return;
   g_hash = hex;
-  RA_LOG("RetroAchievements: disc changed, hash %s\n", hex.c_str());
   rc_client_begin_change_media(g_client, hex.c_str(), change_media_cb, NULL);
 }
 
@@ -761,7 +747,10 @@ bool RA_GetAchievements(std::vector<RAAchievement> & out) {
 void RA_DoFrame() {
   if (!g_client) return;
   drain_responses();
-  if (g_game_loaded.load()) rc_client_do_frame(g_client);
+  if (!g_game_loaded.load()) return;
+  /* with cheats nothing is evaluated, so nothing can unlock; idle keeps the session alive */
+  if (g_cheats.load()) rc_client_idle(g_client);
+  else rc_client_do_frame(g_client);
 }
 
 void RA_Idle() {
@@ -770,14 +759,22 @@ void RA_Idle() {
   rc_client_idle(g_client);
 }
 
-void RA_OnReset() {
+void RA_OnReset(bool cheats_on) {
+  /* the reset ends a cheat session only if all cheats are off now */
+  g_cheats = cheats_on;
   if (!g_client) return;
   bool to_hardcore = g_hc_pending.exchange(false);
   if (to_hardcore) rc_client_set_hardcore_enabled(g_client, 1);
   if (g_game_loaded.load()) rc_client_reset(g_client);
   /* the mode must be visible after the switch as well, not only at game start */
-  if (to_hardcore && g_game_loaded.load()) set_overlay("RetroAchievements: Hardcore mode");
+  if (cheats_on && g_game_loaded.load()) set_overlay(CHEATS_MSG);
+  else if (to_hardcore && g_game_loaded.load()) set_overlay("RetroAchievements: Hardcore mode");
   update_game_status();
+}
+
+void RA_CheatsUsed() {
+  if (g_cheats.exchange(true)) return;
+  if (g_game_loaded.load()) set_overlay(CHEATS_MSG);
 }
 
 bool RA_HardcorePending() {

@@ -10,7 +10,6 @@ find_package(SDL2 REQUIRED)
 find_package(OpenGLES)
 find_package(PkgConfig REQUIRED)
 
-find_package(Boost REQUIRED COMPONENTS system filesystem date_time locale)
 
 if (NOT OPENGLES2_FOUND)
 	return()
@@ -93,9 +92,9 @@ set(yabause_ra_SOURCES
     ../about.c
 ) 
 link_directories( ${link_directories} ${LIBCHDR_LIB_DIR} )
-include_directories( ${PORT_INCLUDE_DIRS} ${Boost_INCLUDE_DIR} "nanogui-sdl/include" "nanogui-sdl/ext/eigen" "rcheevos/include" "rcheevos/src" )
+include_directories( ${PORT_INCLUDE_DIRS} "nanogui-sdl/include" "nanogui-sdl/ext/eigen" "rcheevos/include" "rcheevos/src" )
 add_executable(yabause-retro-arena ${yabause_ra_SOURCES})
-target_link_libraries(yabause-retro-arena yabause  ${Boost_LIBRARIES} pugixml ${YABAUSE_LIBRARIES} ${PORT_LIBRARIES} nanogui stdc++fs  ${LIBCHDR_LIBRARIES} )
+target_link_libraries(yabause-retro-arena yabause  pugixml ${YABAUSE_LIBRARIES} ${PORT_LIBRARIES} nanogui stdc++fs  ${LIBCHDR_LIBRARIES} )
 target_link_libraries( yabause-retro-arena ${LIBCHDR_LIBRARIES} )
 target_link_libraries( yabause-retro-arena ${zlib_STATIC_LIBRARIES} )
 target_link_libraries( yabause-retro-arena dl pthread )   # RetroAchievements: libcurl via dlopen, login thread

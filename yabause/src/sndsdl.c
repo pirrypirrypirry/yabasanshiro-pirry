@@ -23,15 +23,6 @@
 
 #ifdef HAVE_LIBSDL
 
-/* Free-running counters, written only by the SDL audio callback. */
-unsigned int g_snd_dehn = 0;
-unsigned int g_snd_rufe = 0;
-unsigned int g_snd_rat_mil = 1000;
-
-unsigned int g_snd_unter = 0;
-unsigned int g_snd_unter_bytes = 0;
-
-#include "instrument.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
@@ -67,16 +58,11 @@ int SNDSDLMidiOut(u8 data);
 #endif
 
 // ---------------------------------------------------------------------------
-// Decoupled sound path: ring buffer with explicit fill-level accounting,
-//        adaptive fine-trim resampling (+-1%) against crystal/frame jitter,
-//        packet-loss concealment (last pitch period from the ring history)
-//        instead of a hard cut on a real underrun. Tempo and pitch stay
-//        stable when emulation speed drops.
-// Deliberately not included:
-//   - deficit time stretching / grain WSOLA, which ties tempo and pitch to
-//     the emulation speed.
-//   - the CDDA gap fill of the SCSP core, which depends on a different
-//     ring buffer architecture.
+// Decoupled sound path: a ring buffer with an explicit fill count, a small
+// adaptive resampling trim (+-1%) against crystal and frame jitter, and
+// packet-loss concealment (the last pitch period is repeated) instead of a
+// hard cut when the ring runs dry. There is no time stretching, so tempo and
+// pitch do not follow the emulation speed.
 
 static int SNDSDLInit_Stretch(void);
 static void SNDSDLDeInit_Stretch(void);
@@ -86,7 +72,7 @@ static u32 SNDSDLGetAudioSpace_Stretch(void);
 static void MixAudio_Stretch(UNUSED void *userdata, Uint8 *stream, int len);
 static void PushFrame(s32 l, s32 r);
 static void ResetStream(void);
-static int SNDSDLLadetonPause(int was, unsigned int *fuell, unsigned int *aufgefuellt, unsigned int *ziel);
+static int SNDSDLLoadSndPause(int action, unsigned int *fill_amount, unsigned int *filled_up, unsigned int *goal);
 // ---------------------------------------------------------------------------
 
 SoundInterface_struct SNDSDL = {
@@ -121,21 +107,11 @@ SNDSDLMidiOut
 #define YABA_STRETCH_RATIOGAIN      0.10
 #define YABA_STRETCH_RATIOSLEW      0.10
 
-// Emergency band of the fine trim.
-//
-// The normal trim is clamped to +-1% (inaudible). At that clamp two problems
-// occur:
-//   - Ring runs empty: the regulator sits at the upper limit 1.01 and needs
-//     about 8.6 s to recover from a deficit equal to the fill target
-//     (3807 frames); further underruns and PLC seams follow meanwhile.
-//   - Ring runs full: the regulator sits at the lower limit 0.99, the producer
-//     still delivers more, and the excess is dropped block-wise in
-//     SNDSDLUpdateAudio_Stretch() -- a hard forward jump of up to 16 ms.
-// So while the fill level is outside a safety band, the trim may temporarily
-// go to +-1.5% (~26 cents, transient and less noticeable than a seam or a
-// dropped block). Once the target is reached again the +-1% clamp applies.
-// This is not deficit time stretching: 1.5% is a hard limit and the tempo
-// stays tied to the wall clock.
+// Emergency band of the trim. At the +-1% clamp an empty ring needs about
+// 8.6 s to refill (deficit = fill target, 3807 frames), and a full ring has
+// to drop whole blocks in SNDSDLUpdateAudio_Stretch() (a jump of up to 16 ms).
+// Outside the band below, the trim may go to +-1.5% (~26 cents) until the
+// fill level is back at the target.
 #define YABA_STRETCH_RATIOMIN_EMG   0.985
 #define YABA_STRETCH_RATIOMAX_EMG   1.015
 // Lower bound relative to the fill target, below which refilling is accelerated.
@@ -326,23 +302,17 @@ static void MixAudio_Stretch(UNUSED void *userdata, Uint8 *stream, int len) {
 				           gap - fade_n * 4);
 		}
 
-		// Underrun diagnostics: counts underruns and the total missing bytes,
-		// reports at most once per second. Runs only on this (single) SDL audio
-		// callback thread, so plain statics are sufficient.
+		// Underruns within a one-second window. Only this (single) SDL audio
+		// callback thread touches them, so plain statics are sufficient.
 		{
 			static long underrun_count = 0;
-			static struct timespec last_report;
-			static int last_report_init = 0;
+			static struct timespec window_start;
+			static int window_init = 0;
 			static int reprimed_this_window = 0;
 			struct timespec now;
 			double elapsed;
 
 			underrun_count++;
-
-			/* Free-running counters for the per-second status line: never reset,
-			   always counted, turned into per-second rates by the reader. */
-			INSTR(g_snd_unter++);
-			INSTR(g_snd_unter_bytes += (unsigned int)(want - done));
 
 			// After a second underrun within the ~1 s window, flag the regulator in
 			// SNDSDLUpdateAudio_Stretch(): it may temporarily trim up to +1.5%
@@ -354,16 +324,16 @@ static void MixAudio_Stretch(UNUSED void *userdata, Uint8 *stream, int len) {
 			}
 
 			clock_gettime(CLOCK_MONOTONIC, &now);
-			if (!last_report_init) {
-				last_report = now;
-				last_report_init = 1;
+			if (!window_init) {
+				window_start = now;
+				window_init = 1;
 			}
-			elapsed = (double)(now.tv_sec - last_report.tv_sec)
-			        + (double)(now.tv_nsec - last_report.tv_nsec) / 1e9;
+			elapsed = (double)(now.tv_sec - window_start.tv_sec)
+			        + (double)(now.tv_nsec - window_start.tv_nsec) / 1e9;
 			if (elapsed >= 1.0) {
 				underrun_count = 0;
 				reprimed_this_window = 0;
-				last_report = now;
+				window_start = now;
 			}
 		}
 	}
@@ -429,7 +399,7 @@ static int SNDSDLInit_Stretch(void)
 
    SDL_PauseAudio(0);
 
-   g_ladeton_pause = SNDSDLLadetonPause;
+   g_loadsnd_pause = SNDSDLLoadSndPause;
 
    return 0;
 }
@@ -443,7 +413,7 @@ static void SNDSDLDeInit(void)
 
 static void SNDSDLDeInit_Stretch(void)
 {
-   g_ladeton_pause = NULL;
+   g_loadsnd_pause = NULL;
    // Closes the device first, so the callback is no longer running by the
    // time the buffer it reads from goes away.
    SDL_CloseAudio();
@@ -493,38 +463,38 @@ static int SNDSDLChangeVideoFormat_Stretch(UNUSED int vertfreq)
    plc_lastP, fill statistics), so there is no multi-second catch-up at 1.015. The interpolation state (soundfrac,
    soundlastl/r) is zeroed only if silence was appended: the last written frame is then 0 and the join is seamless;
    without an append the interpolation continues from the old last frame.
-   nur_unter_ziel=1: if the fill level is at or above the target, everything stays untouched (returns 0). */
-static int LadetonAuffuellenGesperrt(unsigned int *fuell_vorher, unsigned int *aufgefuellt, unsigned int *ziel, int nur_unter_ziel)
+   only_below_target=1: if the fill level is at or above the target, everything stays untouched (returns 0). */
+static int LoadSndFillBlocked(unsigned int *fill_before, unsigned int *filled_up, unsigned int *goal, int only_below_target)
 {
    const u32 framebytes = sizeof(s16) * 2;
-   u32 soll, add;
+   u32 target_val, add;
    if (stereodata16 == NULL || soundbufsize == 0)
       return 0;
-   soll = soundprefill * framebytes;
-   if (soll > soundbufsize - framebytes)   /* safety clamp: never fill the whole ring */
-      soll = (soundbufsize - framebytes) & ~(framebytes - 1);
-   *fuell_vorher = soundbuffered / framebytes;
-   *ziel = soll / framebytes;
-   if (nur_unter_ziel && soundbuffered >= soll)
+   target_val = soundprefill * framebytes;
+   if (target_val > soundbufsize - framebytes)   /* safety clamp: never fill the whole ring */
+      target_val = (soundbufsize - framebytes) & ~(framebytes - 1);
+   *fill_before = soundbuffered / framebytes;
+   *goal = target_val / framebytes;
+   if (only_below_target && soundbuffered >= target_val)
       return 0;
-   add = (soundbuffered < soll) ? ((soll - soundbuffered) & ~(framebytes - 1)) : 0;
+   add = (soundbuffered < target_val) ? ((target_val - soundbuffered) & ~(framebytes - 1)) : 0;
    if (add > 0)
    {
       u32 rest = add;
       while (rest > 0)   /* append silence at the write end, with ring wrap */
       {
-         u32 stueck = soundbufsize - soundoffset;
-         if (stueck > rest) stueck = rest;
-         memset(((u8 *)stereodata16) + soundoffset, 0, stueck);
-         soundoffset += stueck;
+         u32 piece = soundbufsize - soundoffset;
+         if (piece > rest) piece = rest;
+         memset(((u8 *)stereodata16) + soundoffset, 0, piece);
+         soundoffset += piece;
          if (soundoffset >= soundbufsize) soundoffset = 0;
-         rest -= stueck;
+         rest -= piece;
       }
       soundbuffered += add;
       soundfrac = 0.0;
       soundlastl = 0;
       soundlastr = 0;
-      *aufgefuellt = add / framebytes;
+      *filled_up = add / framebytes;
    }
    /* reset regulator/stretcher state like ResetStream, without touching pointers or contents */
    soundratio = 1.0;
@@ -537,26 +507,26 @@ static int LadetonAuffuellenGesperrt(unsigned int *fuell_vorher, unsigned int *a
 /* Pauses SDL output during a lock. SDL_PauseAudio(1) makes the audio thread output silence without calling the
    callback, so nothing is consumed and ring/regulator stay put; the callback never blocks (SDL only takes the device
    lock briefly, a running callback makes the CALLER wait). Never call under SDL_LockAudio.
-   was=1 pause - was=0 resume + refill only if below target - was=-1 resume only (saving). */
-static int SNDSDLLadetonPause(int was, unsigned int *fuell, unsigned int *aufgefuellt, unsigned int *ziel)
+   action=1 pause - action=0 resume + refill only if below target - action=-1 resume only (saving). */
+static int SNDSDLLoadSndPause(int action, unsigned int *fill_amount, unsigned int *filled_up, unsigned int *goal)
 {
    int r = 0;
-   *fuell = 0; *aufgefuellt = 0; *ziel = 0;
+   *fill_amount = 0; *filled_up = 0; *goal = 0;
    if (stereodata16 == NULL)
       return 0;
-   if (was == 1)
+   if (action == 1)
    {
       SDL_PauseAudio(1);
       SDL_LockAudio();
-      *fuell = soundbuffered / (sizeof(s16) * 2);
+      *fill_amount = soundbuffered / (sizeof(s16) * 2);
       SDL_UnlockAudio();
       return 1;
    }
    SDL_LockAudio();
-   if (was == 0)
-      r = LadetonAuffuellenGesperrt(fuell, aufgefuellt, ziel, 1);
+   if (action == 0)
+      r = LoadSndFillBlocked(fill_amount, filled_up, goal, 1);
    else
-      *fuell = soundbuffered / (sizeof(s16) * 2);
+      *fill_amount = soundbuffered / (sizeof(s16) * 2);
    SDL_UnlockAudio();
    SDL_PauseAudio(0);
    return r;
@@ -636,16 +606,12 @@ static void PushFrame(s32 l, s32 r)
    soundbuffered += sizeof(s16) * 2;
 }
 
-// Adaptive fine-trim resampling. The emulator produces 44100/60 samples per
-// emulated video frame (an audio rate tied to the frame rate), while the
-// device consumes at its own crystal rate of 44100 Hz; the two never match
-// exactly. Without correction the excess is dropped in small chunks
-// (crackling) or gaps appear. The correction is clamped to +-1% (see
-// YABA_STRETCH_RATIOMIN/MAX), far below an audible pitch change. It is
-// deliberately only a crystal/jitter fine trim, not deficit time stretching:
-// on larger production gaps (emulation running below speed) the output stays
-// at the same speed/pitch and the gap itself is covered by PLC/fade in
-// MixAudio_Stretch().
+// Resampling with a small adaptive trim. The emulator produces 44100/60
+// samples per emulated frame, the device consumes at its own 44100 Hz crystal
+// rate, and the two never match exactly. The trim is clamped to +-1%
+// (YABA_STRETCH_RATIOMIN/MAX), far below an audible pitch change. Larger gaps
+// (emulation below full speed) are not stretched; MixAudio_Stretch() covers
+// them with PLC or a fade.
 static void SNDSDLUpdateAudio_Stretch(u32 *leftchanbuffer, u32 *rightchanbuffer, u32 num_samples)
 {
    const s32 *srcl = (const s32 *)leftchanbuffer;
@@ -662,7 +628,7 @@ static void SNDSDLUpdateAudio_Stretch(u32 *leftchanbuffer, u32 *rightchanbuffer,
       return;
    }
 
-   // soundfrac walks the input block; every time it lands somewhere we emit
+   // soundfrac walks the input block; every step emits
    // one output frame interpolated between the two input frames it falls
    // between. soundlastl/r carry the block's last frame so the interpolation
    // is continuous across calls instead of restarting at every block
@@ -740,19 +706,6 @@ static void SNDSDLUpdateAudio_Stretch(u32 *leftchanbuffer, u32 *rightchanbuffer,
 
    soundratio += (want - soundratio) * YABA_STRETCH_RATIOSLEW;
 
-   /* Stretch statistics. soundratio = output frames per input frame; 1.0 = no stretching.
-      g_snd_dehn counts regulation steps with more than 0.5% stretching, g_snd_rufe counts
-      all steps (their ratio is the stretch rate), g_snd_rat_mil holds the current ratio x1000. */
-#ifdef YABA_INSTRUMENT
-   {
-      const double abw = (soundratio > 1.0) ? (soundratio - 1.0) : (1.0 - soundratio);
-      g_snd_rufe++;
-      /* The threshold lies below the clamp ([0.99, 1.01], emergency band
-         [0.985, 1.015]); 0.5% is the range in which the regulator actually works. */
-      if (abw > 0.005) g_snd_dehn++;
-      g_snd_rat_mil = (unsigned int)(soundratio * 1000.0 + 0.5);
-   }
-#endif
 
 
    SDL_UnlockAudio();
@@ -780,8 +733,8 @@ static u32 SNDSDLGetAudioSpace_Stretch(void)
    SDL_UnlockAudio();
 
    // Reported in input frames. One input frame becomes `ratio` output
-   // frames, so while the resampler is compressing we can take in more than
-   // we have room for. One frame is held back to cover soundfrac's carry.
+   // frames, so while the resampler is compressing more input fits than
+   // there is room for in the ring. One frame is held back to cover soundfrac's carry.
    in = (double)freeframes / ratio;
    if (in < 2.0)
       return 0;

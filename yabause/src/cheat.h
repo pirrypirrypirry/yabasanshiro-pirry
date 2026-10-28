@@ -65,6 +65,7 @@ typedef struct
    u32 val;
    char *desc;
    int enable;
+   int group;   /* entry number from a .cht file (cheatN), -1 = added on its own */
 } cheatlist_struct;
 
 int CheatInit(void);
@@ -83,6 +84,8 @@ void CheatDoPatches(void);
 cheatlist_struct *CheatGetList(int *cheatnum);
 int CheatSave(const char *filename);
 int CheatLoad(const char *filename);
+int CheatLoadCht(const char *filename);
+void CheatEnableGroup(int group, int enable);
 
 #if defined (__cplusplus)
 }

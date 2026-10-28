@@ -1781,12 +1781,6 @@ int checkCHD(const char *filename ) {
 
 }
 
-/* See LoadCHD. Pregap handling for CHD images (always on). */
-static int ChdPregapOn(void)
-{
-  return 1;   /* fixed on */
-}
-
 static int LoadCHD(const char *chd_filename, FILE *iso_file)
 {
   int trak_number;
@@ -1813,8 +1807,8 @@ static int LoadCHD(const char *chd_filename, FILE *iso_file)
 
   track_info_struct trk[100];
   memset(trk, 0, sizeof(trk));
-  int chd_pg_in_daten[100];                  /* pregap in data stream (PGTYPE 'V...')? */
-  memset(chd_pg_in_daten, 0, sizeof(chd_pg_in_daten));
+  int chd_pg_in_data[100];                  /* pregap in data stream (PGTYPE 'V...')? */
+  memset(chd_pg_in_data, 0, sizeof(chd_pg_in_data));
 
   int num_tracks = 0;
 
@@ -1846,7 +1840,7 @@ static int LoadCHD(const char *chd_filename, FILE *iso_file)
 
     trk[num_tracks].pregap = pregap;
     trk[num_tracks].postgap = postgap;
-    chd_pg_in_daten[num_tracks] = (pg_type[0] == 'V');
+    chd_pg_in_data[num_tracks] = (pg_type[0] == 'V');
 
     trk[num_tracks].frames = frame;
     int padded = (frame + CD_TRACK_PADDING - 1) / CD_TRACK_PADDING;
@@ -1954,11 +1948,11 @@ static int LoadCHD(const char *chd_filename, FILE *iso_file)
        track 2 PREGAP 225 MODE1). Default 0 = old behaviour. logframeofs below
        picks up the increased logofs. */
     {
-      const int chdpg_neu = ChdPregapOn() && trk[i].pregap > 0 && !chd_pg_in_daten[i];
-      const u32 logofs_alt = logofs;
-      if (chdpg_neu)
+      const int chdpg_new = trk[i].pregap > 0 && !chd_pg_in_data[i];
+      const u32 logofs_old = logofs;
+      if (chdpg_new)
         logofs += trk[i].pregap;
-      trk[i].fad_start = chdpg_neu ? logofs : logofs_alt + trk[i].pregap;
+      trk[i].fad_start = chdpg_new ? logofs : logofs_old + trk[i].pregap;
     }
     
     trk[i].physframeofs = physofs;
@@ -2021,15 +2015,10 @@ static int ISOCDReadSectorFADFromCHD(u32 FAD, void *buffer) {
   chdlba = loglba;
   for (i = 0; i < disc.session_num; i++)
   {
-    // Iterate every track including the last one. The old loop stopped at
-    // track_num-1 and only compared against track[j+1].logframeofs, so the
-    // final track of any session (and every track of a single-track
-    // session, e.g. Crime Patrol (USA) (Proto)) could never match here:
-    // the read either silently fell through to the wrong track/session or
-    // returned unread with the destination buffer left holding whatever
-    // stale sector was there before, feeding wrong code/data into the
-    // caller. track[j].fad_end equals track[j+1].logframeofs for interior
-    // tracks, and also correctly bounds the last track of the session.
+    // All tracks including the last one of the session: track[j].fad_end
+    // bounds every track, while comparing against track[j+1].logframeofs
+    // could never match the last track (single-track sessions, e.g.
+    // Crime Patrol (USA) (Proto), were never found).
     for (j = 0; j < disc.session[i].track_num; j++)
     {
       if (loglba < disc.session[i].track[j].fad_end) {

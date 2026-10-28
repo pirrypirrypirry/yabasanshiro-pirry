@@ -130,17 +130,17 @@ void SmpcRecheckRegion(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 /* System language (SMEM[3] bits 0-3), set from the config (main.cpp) and re-applied on every reset. */
-static int g_systemsprache = 0;
-void SmpcSetSystemsprache(int id) {
+static int g_system_language = 0;
+void SmpcSetSystemLanguage(int id) {
    if (id < 0 || id > 5) id = 0;
-   g_systemsprache = id;
+   g_system_language = id;
    if (SmpcInternalVars) SmpcInternalVars->SMEM[3] = (SmpcInternalVars->SMEM[3] & 0xF0) | (u8)id;
 }
 
 void SmpcReset(void) {
    memset((void *)SmpcRegs, 0, sizeof(Smpc));
    memset((void *)SmpcInternalVars->SMEM, 0, 4);
-   SmpcInternalVars->SMEM[3] = (u8)(g_systemsprache & 0xF);
+   SmpcInternalVars->SMEM[3] = (u8)(g_system_language & 0xF);
 
    SmpcRecheckRegion();
 
@@ -484,7 +484,8 @@ static void SmpcINTBACK(void) {
 
    //we think rayman sets 0x40 so that it breaks the intback command immediately when it blocks, 
    //rather than having to set 0x40 in response to an interrupt
-   if ((SmpcInternalVars->intbackIreg0 = (SmpcRegs->IREG[0] & 1))) {
+   /* status report only when IREG0 == 1, not for any value with bit 0 set (Ymir) */
+   if ((SmpcInternalVars->intbackIreg0 = (SmpcRegs->IREG[0] == 1))) {
       // Return non-peripheral data
       SmpcInternalVars->firstPeri = 1;
       SmpcInternalVars->intback = (SmpcRegs->IREG[1] & 0x8) >> 3; // does the program want peripheral data too?
@@ -569,6 +570,8 @@ void SmpcExec(s32 t) {
 
       SmpcInternalVars->timing -= t;
       if (SmpcInternalVars->timing <= 0) {
+         /* OREG31 mirrors COMREG for every command (Ymir) */
+         SmpcRegs->OREG[31] = SmpcRegs->COMREG;
          switch(SmpcRegs->COMREG) {
             case 0x0:
                SMPCLOG("smpc\t: MSHON not implemented\n");

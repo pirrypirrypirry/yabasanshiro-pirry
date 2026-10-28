@@ -1643,7 +1643,6 @@ int YabLoadStateStream(FILE *fp)
    /* collect the pending VBlank token before the state is overwritten,
       otherwise the next join hangs (see vdp2.cpp) */
    { extern void Vdp2DrainPendingVIN(void); Vdp2DrainPendingVIN(); }
-   { extern void Vdp1VorLaden(void); Vdp1VorLaden(); }
    char id[3];
    u8 endian;
    int headerversion, version, size, chunksize, headersize;
@@ -1856,8 +1855,8 @@ int YabLoadStateStream(FILE *fp)
 
    /* Clear the orphaned wait line and leftover markers of the previous frame
       loop; must come last, after everything the load restores (see
-      Vdp2NachSpielstand() in vdp2.cpp). */
-   { extern void Vdp2NachSpielstand(void); Vdp2NachSpielstand(); }
+      Vdp2AfterLoadState() in vdp2.cpp). */
+   { extern void Vdp2AfterLoadState(void); Vdp2AfterLoadState(); }
 
    return 0;
 }

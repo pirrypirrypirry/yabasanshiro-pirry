@@ -53,9 +53,6 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "smpc.h"
 #include "yui.h"
 
-/* Counter for the bit 31 masking below (Panzer Dragoon workaround), read by the
-   profiling output in DynarecSh2.cpp. Incremented once per disc parse. */
-
 #define CDB_HIRQ_CMOK      0x0001
 #define CDB_HIRQ_DRDY      0x0002
 #define CDB_HIRQ_CSCT      0x0004
@@ -311,6 +308,8 @@ void FASTCALL Cs2WriteWord(u32 addr, u16 val) {
                   return;
     case 0x9000C: 
     case 0x9000E: Cs2Area->reg.HIRQMASK = val;
+                  /* unmasking a pending HIRQ raises the interrupt (Kronos, Ymir, Mednafen) */
+                  if (Cs2Area->reg.HIRQ & val) ScuSendExternalInterrupt00();
                   return;
     case 0x90018: 
     case 0x9001A: Cs2Area->status &= ~CDB_STAT_PERI;
@@ -1660,7 +1659,8 @@ void Cs2InitializeCDSystem(void) {
      val &= ~CDB_HIRQ_DCHG;
 
   doCDReport(Cs2Area->status);
-  Cs2SetIRQ(val | CDB_HIRQ_CMOK | CDB_HIRQ_ESEL);
+  /* also report EFLS|ECPY|EHST (Ymir) */
+  Cs2SetIRQ(val | CDB_HIRQ_CMOK | CDB_HIRQ_ESEL | CDB_HIRQ_EFLS | CDB_HIRQ_ECPY | CDB_HIRQ_EHST);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1763,6 +1763,7 @@ void Cs2PlayDisc(void) {
   pdspos = ((Cs2Area->reg.CR1 & 0xFF) << 16) | Cs2Area->reg.CR2;
   pdepos = ((Cs2Area->reg.CR3 & 0xFF) << 16) | Cs2Area->reg.CR4;
   pdpmode = Cs2Area->reg.CR3 >> 8;
+  const int pdnopickup = (pdpmode != 0xFF) && (pdpmode & 0x80);   /* "no pickup change" */
 
   //CDLOG("[CDB] Command: Play; Start = 0x%06x, End = 0x%06x, Mode = 0x%02x", pdspos, pdepos, pdpmode);
    u32 current_fad = Cs2Area->FAD;
@@ -1835,6 +1836,16 @@ void Cs2PlayDisc(void) {
   if (pdpmode != 0)
      CDLOG("cs2\t: playDisc: Unsupported play mode = %02X\n", pdpmode);
 #endif
+
+  /* "no pickup change" while playing: keep reading without a new seek, so gapless
+     streams have no gap (1.20.46, Mednafen) */
+  if (pdnopickup && (Cs2Area->status & 0xF) == CDB_STAT_PLAY) {
+     Cs2Area->playtype = CDB_PLAYTYPE_SECTOR;
+     Cs2Area->cdi->ReadAheadFAD(Cs2Area->FAD);
+     doCDReport(Cs2Area->status);
+     Cs2SetIRQ(CDB_HIRQ_CMOK);
+     return;
+  }
 
   Cs2SetTiming(1);
 
@@ -2497,6 +2508,19 @@ static INLINE int CalcSectorOffsetNumber(u32 bufno, u32 *sectoffset, u32 *sectnu
    return (*sectnum == 0) ? 0 : 1;
 }
 
+/* Range outside the partition: report Wait (CMOK only) instead of a partial transfer;
+   also keeps Delete from walking past the block array (Ymir). Returns 1 if handled. */
+static int SectorRangeOutside(u32 bufno, u32 off, u32 num)
+{
+   const u32 nb = Cs2Area->partition[bufno].numblocks;
+   if (off >= nb || num > nb - off) {
+      doCDReport(Cs2Area->status | CDB_STAT_WAIT);
+      Cs2SetIRQ(CDB_HIRQ_CMOK);
+      return 1;
+   }
+   return 0;
+}
+
 //////////////////////////////////////////////////////////////////////////////
 
 #define CDTRANSLOG(t) do {} while (0)
@@ -2537,6 +2561,8 @@ void Cs2GetSectorData(void)
       Cs2SetIRQ(CDB_HIRQ_CMOK | CDB_HIRQ_EHST);
       return;
    }
+
+   if (SectorRangeOutside(gsdbufno, gsdsectoffset, gsdsectnum)) return;
 
    // Setup Data Transfer
    Cs2Area->cdwnum = 0;
@@ -2590,6 +2616,8 @@ void Cs2DeleteSectorData(void)
       Cs2SetIRQ(CDB_HIRQ_CMOK | CDB_HIRQ_EHST);
       return;
    }
+
+   if (SectorRangeOutside(dsdbufno, dsdsectoffset, dsdsectnum)) return;
 
    for (i = dsdsectoffset; i < (dsdsectoffset+dsdsectnum); i++)
    {
@@ -2650,6 +2678,8 @@ void Cs2GetThenDeleteSectorData(void)
       Cs2SetIRQ(CDB_HIRQ_CMOK | CDB_HIRQ_EHST);
       return;
    }
+
+   if (SectorRangeOutside(gtdsdbufno, gtdsdsectoffset, gtdsdsectnum)) return;
 
    // Setup Data Transfer
    Cs2Area->cdwnum = 0;
@@ -4466,11 +4496,11 @@ int Cs2LoadState(FILE * fp, int version, int size) {
    /* blockfreespace in older save states may be too low; recompute it from the
       actual block usage instead of taking the saved value. */
    {
-      int frei_ = 0, i3_;
+      int free_cnt = 0, i3_;
       for (i3_ = 0; i3_ < MAX_BLOCKS; i3_++)
-         if (Cs2Area->block[i3_].size == -1) frei_++;
-      Cs2Area->blockfreespace = frei_;
-      Cs2Area->isbufferfull = (frei_ <= 0) ? 1 : 0;
+         if (Cs2Area->block[i3_].size == -1) free_cnt++;
+      Cs2Area->blockfreespace = free_cnt;
+      Cs2Area->isbufferfull = (free_cnt <= 0) ? 1 : 0;
    }
 
    // Read filter data

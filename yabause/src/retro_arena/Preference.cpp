@@ -37,7 +37,7 @@ Preference::Preference( const std::string & filename ){
 
   try{
     std::ifstream fin( this->filename );
-    this->gab_es_schon = fin.good();
+    this->existed_before = fin.good();
     fin >> j;
     fin.close();
   }catch ( json::exception& e ){
@@ -50,34 +50,34 @@ Preference::~Preference(){
      Without a config there is no "state path", and save states would
      silently end up in ~/.yabasanshiro. An existing file is never
      overwritten here. */
-  if (!this->gab_es_schon) lege_standard_an();
+  if (!this->existed_before) create_defaults();
 
-  if (!this->geaendert) return;
-  schreibe_nur_geaenderte();
+  if (!this->changed) return;
+  write_changed_only();
 }
 
 /* Creates a missing per-game config with default values. The values are
    built in; only `state path` is taken from `~/.yabasanshiro/default.config`
    if it is set there. */
-void Preference::lege_standard_an(){
+void Preference::create_defaults(){
   /* Another Preference instance may have created the file since this one was
      constructed. Never replace it, or that instance's settings would be lost. */
   {
-    std::ifstream schon( this->filename );
-    if (schon.good()) {
-      this->gab_es_schon = true;
+    std::ifstream existing_file( this->filename );
+    if (existing_file.good()) {
+      this->existed_before = true;
       return;
     }
   }
 
   /* Defaults that apply everywhere, independent of the device. */
-  json vorlage = json::object();
-  vorlage["Aspect rate"]              = 0;
-  vorlage["Resolution"]               = 3;
-  vorlage["Rotate screen"]            = false;
-  vorlage["Rotate screen resolution"] = 0;
-  vorlage["force 50hz"]               = false;
-  vorlage["texcache persist"]         = true;
+  json tmpl = json::object();
+  tmpl["Aspect rate"]              = 0;
+  tmpl["Resolution"]               = 3;
+  tmpl["Rotate screen"]            = false;
+  tmpl["Rotate screen resolution"] = 0;
+  tmpl["force 50hz"]               = false;
+  tmpl["texcache persist"]         = true;
 
   /* "state path" has no built-in default, since the directory may not exist
      on another device. It is taken from the global `~/.yabasanshiro/default.config`
@@ -87,9 +87,9 @@ void Preference::lege_standard_an(){
   {
     const char * hd = getenv("HOME");
     if (hd != NULL) {
-      std::string gpfad = std::string(hd) + "/.yabasanshiro/default.config";
+      std::string gpath = std::string(hd) + "/.yabasanshiro/default.config";
       try{
-        std::ifstream gin( gpfad );
+        std::ifstream gin( gpath );
         if (gin.good()) {
           json global;
           gin >> global;
@@ -97,7 +97,7 @@ void Preference::lege_standard_an(){
              does not provide it. find() is available in every version. */
           json::const_iterator it = global.find("state path");
           if (global.is_object() && it != global.end() && it->is_string()) {
-            vorlage["state path"] = *it;
+            tmpl["state path"] = *it;
           }
         }
         gin.close();
@@ -107,39 +107,39 @@ void Preference::lege_standard_an(){
 
   std::ofstream out( this->filename );
   if (!out) return;
-  out << vorlage.dump(2);
+  out << tmpl.dump(2);
   out.close();
-  this->gab_es_schon = true;   /* so that schreibe_nur_geaenderte() builds on it */
+  this->existed_before = true;   /* so that write_changed_only() builds on it */
 }
 
 /* Writes only the keys that were set via setInt/setBool during this run.
    The file is re-read from disk, the changed keys are merged in and the file
    is written back, so external edits made while running are not overwritten
    by stale values from `j`. */
-void Preference::schreibe_nur_geaenderte(){
-  if (this->geaenderte_schluessel.empty()) return;
+void Preference::write_changed_only(){
+  if (this->changed_keys.empty()) return;
 
   /* First write of a new config: create it with the defaults (including
      `state path`) and merge the changed keys into that, instead of writing a
      file that only holds the changed keys. */
-  if (!this->gab_es_schon) lege_standard_an();
+  if (!this->existed_before) create_defaults();
 
-  json auf_platte;
+  json on_disk;
   try{
     std::ifstream fin( this->filename );
-    if (fin) fin >> auf_platte;
+    if (fin) fin >> on_disk;
     fin.close();
   }catch ( json::exception& e ){
-    auf_platte = json::object();
+    on_disk = json::object();
   }
-  if (!auf_platte.is_object()) auf_platte = json::object();
+  if (!on_disk.is_object()) on_disk = json::object();
 
-  for (const auto & k : this->geaenderte_schluessel) {
-    auf_platte[k] = j[k];
+  for (const auto & k : this->changed_keys) {
+    on_disk[k] = j[k];
   }
 
   std::ofstream out(this->filename);
-  out << auf_platte.dump(2);
+  out << on_disk.dump(2);
   out.close();
 }
 
@@ -176,6 +176,38 @@ int Preference::getIntGlobal( const std::string & key , int defaultv ){
   } catch ( json::exception & e ) {}
   return defaultv;
 }
+
+static std::string GlobalPath(){
+  const char * hd = getenv("HOME");
+  return std::string(hd != NULL ? hd : "") + "/.yabasanshiro/default.config";
+}
+
+int Preference::getIntOnlyGlobal( const std::string & key , int defaultv ){
+  try {
+    std::ifstream gin( GlobalPath() );
+    if (gin.good()) {
+      json global; gin >> global;
+      json::iterator it = global.find(key);
+      if (it != global.end() && it->is_number()) return it->get<int>();
+      if (it != global.end() && it->is_boolean()) return it->get<bool>() ? 1 : 0;
+    }
+  } catch ( json::exception & e ) {}
+  return defaultv;
+}
+
+void Preference::setIntGlobal( const std::string & key , int value ){
+  json global = json::object();
+  try {
+    std::ifstream gin( GlobalPath() );
+    if (gin.good()) gin >> global;
+  } catch ( json::exception & e ) { global = json::object(); }
+  if (!global.is_object()) global = json::object();
+  global[key] = value;
+  std::ofstream out( GlobalPath() );
+  if (!out) return;
+  out << global.dump(2);
+}
+
 bool Preference::getBool( const std::string & key , bool defaultv = false ){
   try {
     LOG("Preference: getBool %s:%d\n", key.c_str(),j[key].get<bool>() );
@@ -201,14 +233,14 @@ std::string Preference::getString( const std::string & key , const std::string &
 
 void Preference::setInt( const std::string & key , int value ){
   j[key] = value;
-  this->geaendert = true;
-  this->geaenderte_schluessel.insert(key);
-  schreibe_nur_geaenderte();
+  this->changed = true;
+  this->changed_keys.insert(key);
+  write_changed_only();
 }
 
 void Preference::setBool( const std::string & key , bool value ){
   j[key] = value;
-  this->geaendert = true;
-  this->geaenderte_schluessel.insert(key);
-  schreibe_nur_geaenderte();
+  this->changed = true;
+  this->changed_keys.insert(key);
+  write_changed_only();
 }

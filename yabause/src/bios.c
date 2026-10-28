@@ -63,9 +63,6 @@ const int tweak_backup_file_size = 1024 * 1024 * 8;
    below), not on a single harmless hit. It is not reset at run time. */
 int g_bios_game_needs_bios = 0;
 
-/* Counters for the two safety nets in this file, read by the profiling output in
-   DynarecSh2.cpp (declared there via extern "C"). They count actual interventions only. */
-
 /* Thresholds for the endless loop detection: more than BIOSNEED_STREAK_THRESHOLD
    hits of the SAME vector within BIOSNEED_STREAK_WINDOW_SEC seconds indicate a hung
    game. A game that merely polls an unimplemented vector occasionally (e.g. once per
@@ -1715,7 +1712,7 @@ static void FASTCALL BiosHandleScuInterruptReturn(SH2_struct * sh)
    The dynarec caller does not advance the PC after BiosHandleFunc, so every
    handler sets PC = PR itself; an empty break would leave the PC on the trap
    address and loop forever. */
-static void BiosLeerVektor(SH2_struct * sh, unsigned int idx)
+static void BiosEmptyVector(SH2_struct * sh, unsigned int idx)
 {
    SH2GetRegisters(sh, &sh->regs);
    sh->regs.PC = sh->regs.PR;
@@ -1725,7 +1722,7 @@ static void BiosLeerVektor(SH2_struct * sh, unsigned int idx)
 
 //////////////////////////////////////////////////////////////////////////////
 
-#define BUPLOG(fn, sh, name, mitnamen) fn(sh)
+#define BUPLOG(fn, sh, name, with_names) fn(sh)
 
 int FASTCALL BiosHandleFunc(SH2_struct * sh)
 {
@@ -1785,7 +1782,7 @@ int FASTCALL BiosHandleFunc(SH2_struct * sh)
          BUPLOG(BiosBUPInit, sh, "Init", 0);
          break;
       case 0x60: // 0x06000380
-         BiosLeerVektor(sh, 0x60);
+         BiosEmptyVector(sh, 0x60);
          break;
       case 0x61: // 0x06000384
          BUPLOG(BiosBUPSelectPartition, sh, "SelectPartition", 0);
@@ -1818,7 +1815,7 @@ int FASTCALL BiosHandleFunc(SH2_struct * sh)
          BUPLOG(BiosBUPSetDate, sh, "SetDate", 0);
          break;
       case 0x6B: // 0x060003AC
-         BiosLeerVektor(sh, 0x6B);
+         BiosEmptyVector(sh, 0x6B);
          break;
       case 0x80: // Interrupt Handler
       case 0x81:
@@ -1869,12 +1866,12 @@ int FASTCALL BiosHandleFunc(SH2_struct * sh)
            with return 0 ("not handled") and the caller (sh2int.c) raises an SH2
            invalid opcode exception, so the game jumps to its own handler. Setting
            PC = PR or returning 1 instead left the game stalled. */
-        int wildsprung = (sh->regs.PC < 0x200 || sh->regs.PC > 0x4FF);
+        int wild_jump = (sh->regs.PC < 0x200 || sh->regs.PC > 0x4FF);
 
         /* Do not set the "GAME NEEDS BIOS" OSD message on the first hit: only the
            endless loop signature of a hung game (the same vector hit very often
            within a short time window, constants above) triggers it. */
-        if (!g_bios_game_needs_bios && !wildsprung)
+        if (!g_bios_game_needs_bios && !wild_jump)
         {
            struct timespec now;
            clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1903,21 +1900,6 @@ int FASTCALL BiosHandleFunc(SH2_struct * sh)
                     g_bios_game_needs_bios = 1;
                  }
               }
-           }
-        }
-
-        /* Safety net (disabled): jump back with PC = PR instead of leaving the
-           emulation stuck on the trap address of an unmapped BIOS index. */
-        {
-           static const int safe_return = 0;   /* fixed off */
-           if (safe_return)
-           {
-              SH2GetRegisters(sh, &sh->regs);
-              sh->regs.R[0] = 0;
-              sh->regs.PC = sh->regs.PR;
-              SH2SetRegisters(sh, &sh->regs);
-              sh->cycles += 128;
-              return 1;
            }
         }
 

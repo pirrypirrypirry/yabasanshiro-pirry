@@ -180,7 +180,7 @@ static_assert(offsetof(Block, flags) == 2060, "Block.flags must be at offset 206
 /* Marks blocks whose BLOCK_LOOP was set through the cycle-over-a-jump case,
    as opposed to the adjacency case (cycle through fall-through). A separate
    bit is needed because BLOCK_LOOP_ADJ is set by both cases. */
-#define BLOCK_LOOP_ZYK (0x08)
+#define BLOCK_LOOP_CYC (0x08)
 
 #include <cstddef>   /* offsetof */
 #define IN_INFINITY_LOOP (-1)
@@ -204,29 +204,29 @@ struct tagSH2
   u32 exitcount;
   /* Resolved base pointers of the work RAM, appended at the end so that all
      existing offsets used in dynalib_arm64.s stay unchanged. */
-  u32 inlinemem_an;       /* flag read by the generated code, offset 164; also
+  u32 inlinemem_on;       /* flag read by the generated code, offset 164; also
                              keeps the following pointers 8-byte aligned */
   uintptr_t hiwram_base;  /* HighWram, resolved  -> offset 168 */
   uintptr_t lowram_base;  /* LowWram,  resolved  -> offset 176 */
-  uintptr_t praesenz_bits; /* CompileBlocks::parent_bits -> offset 184 */
+  uintptr_t presence_bits; /* CompileBlocks::parent_bits -> offset 184 */
   u32 memcycle;            /* memory access cycles of the running block -> offset 192 */
   u32 memcycle_pad;        /* keeps the following fields 8-byte aligned (offset 196) */
   uintptr_t lookup_hw;     /* &CompileBlocks::LookupTable[0] (HWRAM) -> offset 200 */
   uintptr_t cur_block;     /* last entered block (used by the chaining stub) -> offset 208 */
-  uintptr_t kette_ziel;    /* address of kette_stub -> offset 216 */
+  uintptr_t chain_target;    /* address of chain_stub -> offset 216 */
 };
 
 /* The offsets are hard-coded in dynalib_arm64.s. If the structure changes,
    adjust the assembly, not these checks. */
 static_assert(offsetof(tagSH2, getmembyte) == (16+3+7)*4,      "function pointer offset moved");
-static_assert(offsetof(tagSH2, inlinemem_an) == (16+3+7)*4+7*8+4, "inlinemem_an must be at offset 164");
+static_assert(offsetof(tagSH2, inlinemem_on) == (16+3+7)*4+7*8+4, "inlinemem_on must be at offset 164");
 static_assert(offsetof(tagSH2, hiwram_base) == (16+3+7)*4+8*8, "hiwram_base must be at offset 168");
 static_assert(offsetof(tagSH2, lowram_base) == (16+3+7)*4+9*8, "lowram_base must be at offset 176");
-static_assert(offsetof(tagSH2, praesenz_bits) == (16+3+7)*4+10*8, "praesenz_bits must be at offset 184");
+static_assert(offsetof(tagSH2, presence_bits) == (16+3+7)*4+10*8, "presence_bits must be at offset 184");
 static_assert(offsetof(tagSH2, memcycle) == (16+3+7)*4+11*8, "memcycle must be at offset 192");
 static_assert(offsetof(tagSH2, lookup_hw)  == 200, "lookup_hw must be at offset 200");
 static_assert(offsetof(tagSH2, cur_block)  == 208, "cur_block must be at offset 208");
-static_assert(offsetof(tagSH2, kette_ziel) == 216, "kette_ziel must be at offset 216");
+static_assert(offsetof(tagSH2, chain_target) == 216, "chain_target must be at offset 216");
 static_assert(offsetof(tagSH2, SysReg) + 5*4 == 96, "ICOUNT (SysReg[5]) must be at offset 96");
 
 // Instruction
@@ -299,19 +299,13 @@ extern "C" {
   void memSetLongFast(u32, u32);
   void memSetWordFast(u32, u16);
   void memSetByteFast(u32, u8);
-  void kette_stub(void); void epilogue_k(void); void PageFlip_k(void);
+  void chain_stub(void); void epilogue_k(void); void PageFlip_k(void);
   void seperator_delay_slot_k(void); void seperator_delay_after_k(void);
   u32 memGetLongFast4(u32);  u16 memGetWordFast4(u32);  u8 memGetByteFast4(u32);
   u32 memGetLongFast5(u32);  u16 memGetWordFast5(u32);  u8 memGetByteFast5(u32);
-  int MemFastIoFastAn(void);       /* IoFastAn() from DynarecSh2CInterface.cpp */
   void DebugLog(const char * format, ...);
 }
 
-/* Block cache statistics are disabled; the compiler removes all
-   `if (diag_)` blocks that depend on this constant. */
-static inline bool DegenDiagOn() {
-  return false;
-}
 
 class CompileBlocks {
 private:
@@ -362,14 +356,14 @@ public:
      it is much smaller than LookupParentTable and fits in the cache. A missed
      clear only costs speed; a missed set would skip an invalidation. */
   u32 * parent_bits;   /* 0x80000 Bits = 16384 x u32 */
-  inline void PraesenzSetzen(u32 a) { parent_bits[a >> 5] |= (1u << (a & 31)); }
-  inline void PraesenzLoeschen(u32 a) { parent_bits[a >> 5] &= ~(1u << (a & 31)); }
-  inline bool PraesenzGesetzt(u32 a) const {
+  inline void PresenceSet(u32 a) { parent_bits[a >> 5] |= (1u << (a & 31)); }
+  inline void PresenceClear(u32 a) { parent_bits[a >> 5] &= ~(1u << (a & 31)); }
+  inline bool PresenceIsSet(u32 a) const {
     return (parent_bits[a >> 5] & (1u << (a & 31))) != 0;
   }
   /* after remove(): clear the bit only if the list is really empty */
-  inline void PraesenzNachRemove(u32 a) {
-    if (LookupParentTable[a].size() == 0) PraesenzLoeschen(a);
+  inline void PresenceAfterRemove(u32 a) {
+    if (LookupParentTable[a].size() == 0) PresenceClear(a);
   }
   Block* LookupTableRom[0x80000>>1];
   Block* LookupTableLow[0x100000>>1];
@@ -389,7 +383,7 @@ public:
   inline void setDirty(u32 addr) {
     addr = adress_mask(addr);
     /* prefilter through the presence bitmap */
-    if (!PraesenzGesetzt(addr)) return;
+    if (!PresenceIsSet(addr)) return;
     if (LookupParentTable[addr].size() == 0) return;
     setDirtySlow(addr);
   }
@@ -413,15 +407,6 @@ public:
   u32 exec_count_;
   u32 remove_count_;
 
-  /* Cumulative block cache counters, only updated when DegenDiagOn() is true
-     (currently constant false, so they stay 0). */
-  u64 diag_compiles_total_ = 0;
-  u64 diag_compiles_new_   = 0;
-  u64 diag_compiles_reuse_ = 0;
-  u64 diag_evictions_      = 0;
-  u64 diag_invalidations_  = 0;
-  u64 diag_parent_pushes_  = 0;
-  u64 diag_parent_removed_ = 0;
 
   void ShowStatics();
   void SetDebugMode(bool debug) { debug_mode_ = debug;  }
@@ -440,12 +425,9 @@ protected:
   bool one_step_;
   u32 pre_exe_count_;
   bool is_slave_ = false;
-  /* Whether the last IN_INFINITY_LOOP return came from the cycle case;
-     Execute() returns that value in several other situations as well. */
-  bool letzter_zyk_ = false;
   /* Block address of the first slave lock in the current time slice
      (kept in the CPU object, not in struct Block). 0 = none yet. */
-  u32 zs_erste_scheibe_ = 0;
+  u32 fs_first_block_ = 0;
   u32 pre_PC_;
   SH2_struct * ctx_;
   YabMutex * mtx_;
@@ -480,9 +462,9 @@ public:
        before the memory is allocated and would store NULL. */
     m_pDynaSh2->hiwram_base = (uintptr_t)HighWram;
     m_pDynaSh2->lowram_base = (uintptr_t)LowWram;
-    m_pDynaSh2->praesenz_bits = (uintptr_t)CompileBlocks::getInstance()->parent_bits;
+    m_pDynaSh2->presence_bits = (uintptr_t)CompileBlocks::getInstance()->parent_bits;
     m_pDynaSh2->lookup_hw  = (uintptr_t)&CompileBlocks::getInstance()->LookupTable[0];
-    m_pDynaSh2->kette_ziel = (uintptr_t)kette_stub;
+    m_pDynaSh2->chain_target = (uintptr_t)chain_stub;
   }
   void SetSlave(bool is_slave) { is_slave_ = is_slave; }
   void SetContext(SH2_struct * ctx) { ctx_= ctx;}

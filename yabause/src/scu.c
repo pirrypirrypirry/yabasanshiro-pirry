@@ -681,6 +681,38 @@ static void writeloadimdest(u8 num, u32 val)
    }
 }
 
+/* DSP DMA from the B-bus (0x05A00000-0x05FBFFFF) is done as two 16-bit reads and the
+   address always advances by 4 bytes, regardless of the DMA step (Mednafen, Ymir).
+   Fixes the noise in Grandia's FMV. */
+static INLINE u32 dsp_dma_read(scudspregs_struct *sc, u32 add) {
+   const u32 a = sc->RA0M << 2;
+   if (a >= 0x05A00000 && a <= 0x05FBFFFF) {
+      const u32 v = ((u32)MappedMemoryReadWord(a, NULL) << 16) | (u32)MappedMemoryReadWord(a | 2, NULL);
+      sc->RA0M += 1;
+      return v;
+   }
+   {
+      const u32 v = MappedMemoryReadLong(a, NULL);
+      sc->RA0M += (add >> 2);
+      return v;
+   }
+}
+
+/* DSP DMA D0 -> program RAM: written from PC on, then PC = TOP; count 0 = 256;
+   hold keeps RA0 (Ymir, Mednafen). */
+static void dsp_dma_prg(scudspregs_struct *sc, u32 inst, u32 count, int hold) {
+   const u32 mode = (inst >> 15) & 0x7;
+   const u32 add = (1 << (mode & 0x2)) &~1;
+   const u32 ra0 = sc->RA0M;
+   u32 i, n = count & 0xFF;
+   u8 idx = sc->PC;
+   if (n == 0) n = 256;
+   for (i = 0; i < n; i++) sc->ProgramRam[idx++] = dsp_dma_read(sc, add);
+   sc->RA0 = hold ? ra0 : sc->RA0M;
+   sc->PC = sc->TOP;
+   sc->ProgControlPort.part.T0 = 0;
+}
+
 void dsp_dma01(scudspregs_struct *sc, u32 inst)
 {
     u32 imm = ((inst & 0xFF));
@@ -698,21 +730,17 @@ void dsp_dma01(scudspregs_struct *sc, u32 inst)
   if (abus_check >= 0x02000000 && abus_check < 0x05900000){
     for (i = 0; i < imm; i++)
     {
-      sc->MD[sel][sc->CT[sel] & 0x3F] = MappedMemoryReadLong((sc->RA0M << 2), NULL);
-      //LOG("read from %08X to [%d][%d] val %08X", (sc->RA0M << 2), sel, sc->CT[sel] & 0x3F, sc->MD[sel][sc->CT[sel] & 0x3F] );
+      sc->MD[sel][sc->CT[sel] & 0x3F] = dsp_dma_read(sc, add);
       sc->CT[sel]++;
       sc->CT[sel] &= 0x3F;
-      sc->RA0M += (add >> 2);
     }
   }
   else{
     for (i = 0; i < imm ; i++)
     {
-      sc->MD[sel][sc->CT[sel] & 0x3F] = MappedMemoryReadLong((sc->RA0M << 2), NULL);
-      //LOG("read from %08X to [%d][%d] val %08X", (sc->RA0M << 2), sel, sc->CT[sel] & 0x3F, sc->MD[sel][sc->CT[sel] & 0x3F]);
+      sc->MD[sel][sc->CT[sel] & 0x3F] = dsp_dma_read(sc, add);
       sc->CT[sel]++;
       sc->CT[sel] &= 0x3F;
-      sc->RA0M += (add >>2);
     }
   }
 
@@ -840,17 +868,14 @@ void dsp_dma03(scudspregs_struct *sc, u32 inst)
     for (i = 0; i < Counter; i++)
     {
       if (sel == 0x04){
-        sc->ProgramRam[index] = MappedMemoryReadLong((sc->RA0M << 2), NULL);
-        //LOG("read from %08X to P[%d] val %08X", (sc->RA0 << 2), index, sc->ProgramRam[index]);
+        sc->ProgramRam[index] = dsp_dma_read(sc, add);
         index++;
       }
       else{
-        sc->MD[sel][sc->CT[sel]&0x3F] = MappedMemoryReadLong((sc->RA0M << 2), NULL);
-        //LOG("read from %08X to [%d][%d] val %08X", (sc->RA0 << 2), sel, sc->CT[sel] & 0x3F, sc->MD[sel][sc->CT[sel] & 0x3F]);
+        sc->MD[sel][sc->CT[sel]&0x3F] = dsp_dma_read(sc, add);
         sc->CT[sel]++;
         sc->CT[sel] &= 0x3F;
       }
-      sc->RA0M += (add >> 2);
 
     }
   }
@@ -859,16 +884,13 @@ void dsp_dma03(scudspregs_struct *sc, u32 inst)
     {
 
       if (sel == 0x04){
-        sc->ProgramRam[index] = MappedMemoryReadLong((sc->RA0M << 2), NULL);
-        //LOG("read from %08X to P[%d] val %08X", (sc->RA0 << 2), index, sc->ProgramRam[index]);
+        sc->ProgramRam[index] = dsp_dma_read(sc, add);
         index++;
       }else{
-        sc->MD[sel][sc->CT[sel]&0x3F] = MappedMemoryReadLong((sc->RA0M << 2), NULL);
-        //LOG("read from %08X to [%d][%d] val %08X", (sc->RA0 << 2), sel, sc->CT[sel] & 0x3F, sc->MD[sel][sc->CT[sel] & 0x3F]);
+        sc->MD[sel][sc->CT[sel]&0x3F] = dsp_dma_read(sc, add);
         sc->CT[sel]++;
         sc->CT[sel] &= 0x3F;
       }
-      sc->RA0M += (add >> 2);
     }
 
     sc->RA0 = sc->RA0M;
@@ -967,7 +989,23 @@ void step_dsp_dma(scudspregs_struct *sc) {
   if (sc->dsp_dma_wait > 0) return;
 
   if (sc->ProgControlPort.part.T0 == 0) return;
-  
+
+  {   /* D0 -> program RAM (sel 4) in all four forms; MD count is 8 bits; sel 5-7 is discarded (Ymir, Mednafen) */
+    const u32 in = sc->dsp_dma_instruction;
+    const int dir_d0 = (in >> 12) & 1, format = (in >> 13) & 1, hold = (in >> 14) & 1, sel = (in >> 8) & 7;
+    if (!dir_d0 && sel == 4) {
+      u32 count = format ? (u32)sc->dsp_dma_size : (in & 0xFF);
+      dsp_dma_prg(sc, in, count, hold);
+      sc->dsp_dma_instruction = 0; sc->dsp_dma_wait = 0;
+      return;
+    }
+    if (!dir_d0 && sel > 4) { sc->ProgControlPort.part.T0 = 0; sc->dsp_dma_instruction = 0; sc->dsp_dma_wait = 0; return; }
+    if (format) {   /* count from MD: 8 bits, 0 = 256 */
+      sc->dsp_dma_size &= 0xFF;
+      if (sc->dsp_dma_size == 0) sc->dsp_dma_size = 256;
+    }
+  }
+
   if (((sc->dsp_dma_instruction >> 10) & 0x1F) == 0x00)
   {
     dsp_dma01(ScuDsp, sc->dsp_dma_instruction);
@@ -1010,17 +1048,16 @@ void step_dsp_dma(scudspregs_struct *sc) {
 
 /* The timer 1 mode bit is bit 8 (0x100), not bit 7 (0x80) (SCU manual 3.4).
    A game writing 0x101 (once per frame, line T0C) must not fire on every line. */
-static u32 ScuT1mdModusBit(void)
-{
-  return 0x100;
-}
+#define SCU_T1MD_MODE_BIT 0x100
 
 INLINE void ScuTimer1Exec( u32 timing ) {
-  if (ScuRegs->timer1_counter > 0) {
-    ScuRegs->timer1_counter = (ScuRegs->timer1_counter - (timing >> 1));
-    if (ScuRegs->timer1_counter <= 0) {
+  /* counter in quarter units (loaded with preset << 2), so the odd cycle of timing >> 1
+     is not lost; same rate (Kronos) */
+  if ((ScuRegs->timer1_counter >> 2) > 0) {
+    ScuRegs->timer1_counter -= (s32)(timing << 1);
+    if ((ScuRegs->timer1_counter >> 2) <= 0) {
       ScuRegs->timer1_set = 1;
-      if ((ScuRegs->T1MD & ScuT1mdModusBit()) == 0) {
+      if ((ScuRegs->T1MD & SCU_T1MD_MODE_BIT) == 0) {
         ScuSendTimer1();
       }
       else if (ScuRegs->timer0_set == 1) {
@@ -1033,7 +1070,7 @@ INLINE void ScuTimer1Exec( u32 timing ) {
 /* Indirect mode: the transfer count in a table entry is 20 bits wide and 0 means
    0x100000, as in direct mode (Mednafen, Ymir). A raw 0 stalled the DMA without an
    end interrupt (Linkle Liver Story). */
-static void DmaIndAnzahl(scudmainfo_struct * dma) {
+static void DmaIndCount(scudmainfo_struct * dma) {
   dma->TransferNumber &= 0xFFFFF;
   if (dma->TransferNumber == 0) dma->TransferNumber = 0x100000;
 }
@@ -1060,7 +1097,43 @@ static int ScuDmaIllegal(const scudmainfo_struct * dmainfo) {
   return rb < 0 || wb < 0 || rb == wb;
 }
 
+/* Indirect DMA: an invalid table entry (see ScuDmaIllegal) is not executed
+   (Ymir, Mednafen). An entry with destination 0 (BIOS ROM, writes have no effect)
+   counts as valid: Linkle Liver Story waits for the end interrupt of such a chain. */
+static int DmaIndInvalid(scudmainfo_struct * dmainfo) {
+  if ((dmainfo->WriteAddress & 0x0FFFFFFF) == 0) return 0;
+  return ScuDmaIllegal(dmainfo);
+}
+
+static void DmaIndReadEntry(scudmainfo_struct *d) {
+  d->TransferNumber = MappedMemoryReadLong(d->InDirectAdress, NULL);
+  DmaIndCount(d);
+  d->WriteAddress = MappedMemoryReadLong(d->InDirectAdress + 4, NULL);
+  d->ReadAddress = MappedMemoryReadLong(d->InDirectAdress + 8, NULL);
+  d->InDirectAdress += 0xC;
+}
+
+/* If the first indirect entry is invalid at start, re-read it during the next
+   ScuDmaProc steps (up to 64) before raising DMA-illegal. Tennis Arena writes the
+   source of its level 1 table only right after the start command. */
+static int s_ind_retry[3] = { 0, 0, 0 };
+static u32 s_ind_retry_tab[3];
+static void DmaIndRetry(scudmainfo_struct *d, int lv)
+{
+  if (s_ind_retry[lv] <= 0) return;
+  d->InDirectAdress = s_ind_retry_tab[lv];
+  DmaIndReadEntry(d);
+  if (!DmaIndInvalid(d)) {
+    s_ind_retry[lv] = 0;
+    return;
+  }
+  d->TransferNumber = 0;
+  if (--s_ind_retry[lv] == 0)
+    ScuSendDMAIllegal();
+}
+
 void ScuSetAddValue(scudmainfo_struct * dmainfo) {
+  if (dmainfo->mode >= 0 && dmainfo->mode < 3) s_ind_retry[dmainfo->mode] = 0;   /* a new start drops a pending re-read */
   if (dmainfo->AddValue & 0x100)
     dmainfo->ReadAdd = 4;
   else
@@ -1097,11 +1170,17 @@ void ScuSetAddValue(scudmainfo_struct * dmainfo) {
   }
   if (dmainfo->ModeAddressUpdate & 0x1000000) {
     dmainfo->InDirectAdress = dmainfo->WriteAddress;
-    dmainfo->TransferNumber = MappedMemoryReadLong(dmainfo->InDirectAdress, NULL);
-    DmaIndAnzahl(dmainfo);
-    dmainfo->WriteAddress = MappedMemoryReadLong(dmainfo->InDirectAdress + 4, NULL);
-    dmainfo->ReadAddress = MappedMemoryReadLong(dmainfo->InDirectAdress + 8, NULL);
-    dmainfo->InDirectAdress += 0xC;
+    DmaIndReadEntry(dmainfo);
+    if (DmaIndInvalid(dmainfo)) {   /* invalid first entry: no start */
+      dmainfo->TransferNumber = 0;
+      if (dmainfo->mode >= 0 && dmainfo->mode < 3) {   /* re-read first, DMA-illegal later */
+        s_ind_retry_tab[dmainfo->mode] = dmainfo->InDirectAdress - 0xC;
+        s_ind_retry[dmainfo->mode] = 64;
+      }
+      else {
+        ScuSendDMAIllegal();
+      }
+    }
   }
   else {
 
@@ -1313,6 +1392,20 @@ void SucDmaExec(scudmainfo_struct * dma, int * time ) {
 }
 
 
+/* Write the DMA addresses back after the transfer: DxMD bit 16 (RUP) -> DxR,
+   bit 8 (WUP) -> DxW; in indirect mode DxW gets the next table address
+   (Ymir, Mednafen). Shinobi X relies on it. */
+static void DmaWriteBack(scudmainfo_struct *dma, int indirect) {
+   u32 *r, *w;
+   switch (dma->mode) {
+      case 0: r = &ScuRegs->D0R; w = &ScuRegs->D0W; break;
+      case 1: r = &ScuRegs->D1R; w = &ScuRegs->D1W; break;
+      default: r = &ScuRegs->D2R; w = &ScuRegs->D2W; break;
+   }
+   if (dma->ModeAddressUpdate & 0x10000) *r = dma->ReadAddress & 0x07FFFFFF;
+   if (dma->ModeAddressUpdate & 0x100) *w = indirect ? (dma->InDirectAdress & 0x07FFFFFF) : (dma->WriteAddress & 0x07FFFFFF);
+}
+
 void SucDmaCheck(scudmainfo_struct * dma, int time) {
   int atime = time;
   if (dma->TransferNumber > 0) {
@@ -1336,14 +1429,23 @@ void SucDmaCheck(scudmainfo_struct * dma, int time) {
               break;
             }
             dma->TransferNumber = 0;
+            DmaWriteBack(dma, 1);
             return;
           }
           else {
-            dma->TransferNumber = MappedMemoryReadLong(dma->InDirectAdress, NULL);
-            DmaIndAnzahl(dma);
-            dma->WriteAddress = MappedMemoryReadLong(dma->InDirectAdress + 4, NULL);
-            dma->ReadAddress = MappedMemoryReadLong(dma->InDirectAdress + 8, NULL);
-            dma->InDirectAdress += 0xC;
+            DmaIndReadEntry(dma);
+            {   /* skip invalid entries; an invalid last entry raises DMA-illegal and ends the chain */
+              int guard = 4096;
+              while (DmaIndInvalid(dma) && --guard > 0) {
+                if (dma->ReadAddress & 0x80000000) {
+                  dma->TransferNumber = 0;
+                  DmaWriteBack(dma, 1);
+                  ScuSendDMAIllegal();
+                  return;
+                }
+                DmaIndReadEntry(dma);
+              }
+            }
           }
         }
       }
@@ -1352,6 +1454,7 @@ void SucDmaCheck(scudmainfo_struct * dma, int time) {
     else {
       SucDmaExec(dma, &atime);
       if (dma->TransferNumber <= 0) {
+        DmaWriteBack(dma, 0);   /* before the end interrupt */
         switch (dma->mode) {
         case 0:
           //LOG("DMA0 Finished!");
@@ -1383,6 +1486,11 @@ void ScuDmaProc(Scu * scu, int time) {
 #if OLD_DMA
   return;
 #endif
+  if (s_ind_retry[0] | s_ind_retry[1] | s_ind_retry[2]) {
+    DmaIndRetry(&scu->dma0, 0);
+    DmaIndRetry(&scu->dma1, 1);
+    DmaIndRetry(&scu->dma2, 2);
+  }
   SucDmaCheck(&scu->dma0, time);
   SucDmaCheck(&scu->dma1, time);
   SucDmaCheck(&scu->dma2, time);
@@ -1390,28 +1498,21 @@ void ScuDmaProc(Scu * scu, int time) {
 
 //////////////////////////////////////////////////////////////////////////////
 static void __attribute__((noinline)) ScuDspExecInner(u32 timing);
-static void __attribute__((noinline)) ScuDspExecVor(u32 timing);
+static void __attribute__((noinline)) ScuDspExecPrecompiled(u32 timing);
 /* Pre-decoding interpreter with a tag cache (16-byte entries, computed goto
    dispatch). The fast path is used only when T0 == 0 and dsp_dma_wait <= 0,
    otherwise exactly one iteration runs in the plain code. Bit-identical to
    ScuDspExecInner. */
-static int s_dspvor = -1;
-static int DspVorAn(void) {
-   if (s_dspvor < 0) {
-      s_dspvor = 1;   /* fixed on */
-   }
-   return s_dspvor;
-}
 
-extern int g_sndreqzug; extern volatile int g_sndreq_vorgemerkt;
+extern int g_sndreq_queued_mode; extern volatile int g_sndreq_pending;
 void ScuExec(u32 timing) {
    int i;
-   if (g_sndreqzug > 0 && __atomic_exchange_n(&g_sndreq_vorgemerkt, 0, __ATOMIC_ACQ_REL)) {
+   if (g_sndreq_queued_mode > 0 && __atomic_exchange_n(&g_sndreq_pending, 0, __ATOMIC_ACQ_REL)) {
       ScuSendSoundRequest();
    }
 
    if ( ScuRegs->T1MD & 0x1 ){
-     if ((ScuRegs->T1MD & ScuT1mdModusBit()) == 0) {
+     if ((ScuRegs->T1MD & SCU_T1MD_MODE_BIT) == 0) {
        ScuTimer1Exec(timing);
      }
      else {
@@ -1453,8 +1554,8 @@ void ScuExec(u32 timing) {
       hot head called for every SH2 slice (timers, DMA) stays small for the
       instruction cache; the DSP is idle in most titles. */
    if (ScuDsp->ProgControlPort.part.EX) {
-      if (ScuBP->numcodebreakpoints == 0 && DspVorAn())
-         ScuDspExecVor(timing);
+      if (ScuBP->numcodebreakpoints == 0)
+         ScuDspExecPrecompiled(timing);
       else
          ScuDspExecInner(timing);
    }
@@ -2093,7 +2194,7 @@ static void __attribute__((noinline)) ScuDspExecInner(u32 timing) {
       }
 }
 
-#include "scu_dspvor.inc"
+#include "scu_dsp_precomp.inc"
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -2912,18 +3013,18 @@ void FASTCALL ScuWriteWord(u32 addr, UNUSED u16 val) {
    at the master and, if it was pending there, put it back into the SCU queue
    (setting IST), so ScuTestInterruptMask fires it on unmasking.
    Master only: the slave does not get its copies via IMS. */
-extern int SH2DynRemoveInterruptTreffer(SH2_struct *context, u8 vector);
-static void ImsRueckNehmen(u32 alt, u32 neu_)
+extern int SH2DynRemoveInterruptHit(SH2_struct *context, u8 vector);
+static void ImsWithdraw(u32 prev_val, u32 new_)
 {
    static const u8 lvl[14] = { 0xF,0xE,0xD,0xC,0xB,0xA,0x9,0x8,0x8,0x6,0x6,0x5,0x3,0x2 };
-   const u32 neu_maskiert = neu_ & ~alt & 0x3FFF;
+   const u32 new_masked = new_ & ~prev_val & 0x3FFF;
    int i;
-   if (neu_maskiert == 0 || SH2Core == NULL || SH2Core->id != 3 /* SH2CORE_DYNAMIC */)
+   if (new_masked == 0 || SH2Core == NULL || SH2Core->id != 3 /* SH2CORE_DYNAMIC */)
       return;
    for (i = 0; i < 14; i++) {
-      if (!(neu_maskiert & (1u << i)))
+      if (!(new_masked & (1u << i)))
          continue;
-      if (SH2DynRemoveInterruptTreffer(MSH2, (u8)(0x40 + i))) {
+      if (SH2DynRemoveInterruptHit(MSH2, (u8)(0x40 + i))) {
          ScuQueueInterrupt((u8)(0x40 + i), lvl[i], (u16)(1u << i), 1u << i);
          ScuRegs->IST |= (1u << i);
       }
@@ -3058,9 +3159,12 @@ void FASTCALL ScuWriteLong(u32 addr, u32 val) {
         break;
       case 0x80: // DSP Program Control Port
          LOG("scu: wrote %08X to DSP Program Control Port", val);
+         {
+         /* PC load (LE) is ignored while the program runs (Ymir) */
+         const int dsp_was_running = ScuDsp->ProgControlPort.part.EX;
          ScuDsp->ProgControlPort.all = (ScuDsp->ProgControlPort.all & 0x00FC0000) | (val & 0x060380FF);
 
-         if (ScuDsp->ProgControlPort.part.LE) {
+         if (ScuDsp->ProgControlPort.part.LE && !dsp_was_running) {
             // set pc
             ScuDsp->PC = (u8)ScuDsp->ProgControlPort.part.P;
             LOG("scu: DSP set pc = %02X", ScuDsp->PC);
@@ -3071,6 +3175,7 @@ void FASTCALL ScuWriteLong(u32 addr, u32 val) {
            // clear internal values
            ScuDsp->jmpaddr = 0xffffffff;
          }
+         }
 
 #ifdef DEBUG
          if (ScuDsp->ProgControlPort.part.EX)
@@ -3079,6 +3184,7 @@ void FASTCALL ScuWriteLong(u32 addr, u32 val) {
          break;
       case 0x84: // DSP Program Ram Data Port
          //LOG("scu: wrote %08X to DSP Program ram offset %02X", val, ScuDsp->PC);
+         if (ScuDsp->ProgControlPort.part.EX) break;   /* program RAM is locked while the program runs */
          ScuDsp->ProgramRam[ScuDsp->PC] = val;
          ScuDsp->PC++;
          ScuDsp->ProgControlPort.part.P = ScuDsp->PC;
@@ -3107,7 +3213,7 @@ void FASTCALL ScuWriteLong(u32 addr, u32 val) {
          ScuRegs->T1MD = val;
          break;
       case 0xA0:
-         ImsRueckNehmen(ScuRegs->IMS, val);
+         ImsWithdraw(ScuRegs->IMS, val);
          ScuRegs->IMS = val;
          //LOG("scu\t: IMS = %X PC=%X frame=%d:%d", val, CurrentSH2->regs.PC, yabsys.frame_count,yabsys.LineCount);
          ScuTestInterruptMask();
@@ -3255,21 +3361,10 @@ static void ScuQueueInterrupt(u8 vector, u8 level, u16 mask, u32 statusbit)
    first and a pending VBlank-IN is then dropped at the SH2; a queued duplicate
    of the same vector is dropped on direct send. Needed by Bug!, which otherwise
    hangs after the SEGA logo. */
-static int s_bb5 = 0;
-static int BootBugAn(void)
-{
-   static int v = -1;
-   if (v < 0) {
-      s_bb5 = 1; v = 4;   /* fixed: stage 5 = stage 4 plus dropping the queued duplicate on direct send */
-   }
-   return v;
-}
 void ScuRemoveInterrupt(u8 vector, u8 level, u32 statusbit)
 {
    int i2 = 0, ii, hit = -1;
    (void)level;
-   if (BootBugAn() != 1 && BootBugAn() != 3 && BootBugAn() != 4)
-      return;
    ScuRegs->IST &= ~statusbit;
    for (ii = 0; ii < (int)ScuRegs->NumberOfInterrupts; ii++) {
       if (ScuRegs->interrupts[ii].vector == vector) { hit = ii; break; }
@@ -3286,7 +3381,7 @@ void ScuRemoveInterrupt(u8 vector, u8 level, u32 statusbit)
 }
 
 /* Drop a queued entry of the same vector (the direct event replaces it). */
-static void Bb5StreicheVektor(u8 vector)
+static void Bb5DropVector(u8 vector)
 {
    int ii, hit = -1, i2 = 0;
    for (ii = 0; ii < (int)ScuRegs->NumberOfInterrupts; ii++)
@@ -3309,8 +3404,8 @@ static INLINE void SendInterrupt(u8 vector, u8 level, u16 mask, u32 statusbit) {
     }
   }else if (!(ScuRegs->IMS & mask)){
     //if (vector != 0x41) LOG("INT %d", vector);
-    if (BootBugAn() == 1 || BootBugAn() == 2 || BootBugAn() == 4) ScuRegs->IST |= statusbit;
-    if (s_bb5) Bb5StreicheVektor(vector);
+    ScuRegs->IST |= statusbit;
+    Bb5DropVector(vector);
     //LOG("%s(%x) at frame %d:%d", ScuGetVectorString(vector), vector, yabsys.frame_count, yabsys.LineCount);
     SH2SendInterrupt(MSH2, vector, level);
     if (yabsys.IsSSH2Running) {
@@ -3437,41 +3532,29 @@ const char * ScuGetVectorString(u32 vec) {
 
 /* Pending timer interrupts are dropped at the next VBlank/HBlank edge, as in
    upstream. Needed by Leynos 2. */
-static int s_tst = -1;
-static int TimerStreichAn(void)
-{
-   if (s_tst < 0) {
-      s_tst = 11;   /* fixed mask */
-   }
-   return s_tst;
-}
 
 void ScuSendVBlankIN(void) {
-   if (BootBugAn() != 4) ScuRemoveVBlankOut();
    //ScuRemoveHBlankIN();
-   if (TimerStreichAn() & 1) ScuRemoveTimer0();
+   ScuRemoveTimer0();
    SendInterrupt(0x40, 0xF, 0x0001, 0x0001);
    ScuChekIntrruptDMA(0);
 }
 
 void ScuRemoveVBlankIN() {
-  if (BootBugAn() == 4) {
-    SH2RemoveInterrupt(MSH2, 0x40, 0x0F);
-    if (yabsys.IsSSH2Running) SH2RemoveInterrupt(SSH2, 0x43, 0x0F);
-  } else
-  ScuRemoveInterrupt(0x40, 0x0F, 0x0001);
+  SH2RemoveInterrupt(MSH2, 0x40, 0x0F);
+  if (yabsys.IsSSH2Running) SH2RemoveInterrupt(SSH2, 0x43, 0x0F);
   //SH2RemoveInterrupt(MSH2, 0x40, 0x0F);
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 void ScuSendVBlankOUT(void) {
-   if (BootBugAn() != 4) ScuRemoveVBlankIN();
-   if (TimerStreichAn() & 2) { ScuRemoveTimer0(); ScuRemoveTimer1(); }
+   ScuRemoveTimer0();
+   ScuRemoveTimer1();
    SendInterrupt(0x41, 0xE, 0x0002, 0x0002);
-   if (BootBugAn() == 4) ScuRemoveVBlankIN();
+   ScuRemoveVBlankIN();
    ScuRegs->timer0 = 0;
-   if (!(TimerStreichAn() & 4) && (ScuRegs->T1MD & 0x1))
+   if (ScuRegs->T1MD & 0x1)
    {
      if (ScuRegs->timer0 == ScuRegs->T0C) {
        ScuRegs->timer0_set = 1;
@@ -3479,7 +3562,7 @@ void ScuSendVBlankOUT(void) {
      }
      else {
        ScuRegs->timer0_set = 0;
-       if (s_tst > 0 && s_tst != 15) ScuRemoveTimer0();
+       ScuRemoveTimer0();
      }
    }
    ScuChekIntrruptDMA(1);
@@ -3487,7 +3570,7 @@ void ScuSendVBlankOUT(void) {
 
 void ScuRemoveVBlankOut() {
   ScuRemoveInterrupt(0x41, 0x0E, 0x0002);
-  if (BootBugAn() == 4) SH2RemoveInterrupt(MSH2, 0x41, 0x0E);
+  SH2RemoveInterrupt(MSH2, 0x41, 0x0E);
   //SH2RemoveInterrupt(MSH2, 0x41, 0x0E);
 }
 
@@ -3501,10 +3584,7 @@ void ScuRemoveVBlankOut() {
    an overshoot (Lunar: Silver Star Story text box jumps). Port of Yaba Sanshiro
    1.20.51 scu.c. */
 void ScuRemoveHBlankIN() {
-  if (BootBugAn() == 4) {
-    if (yabsys.IsSSH2Running) SH2RemoveInterrupt(SSH2, 0x41, 0x0D);
-  } else
-  ScuRemoveInterrupt(0x42, 0x0D, 0x0004);
+  if (yabsys.IsSSH2Running) SH2RemoveInterrupt(SSH2, 0x41, 0x0D);
   //SH2RemoveInterrupt(MSH2, 0x42, 0x0D);
 }
 
@@ -3522,13 +3602,13 @@ void ScuSendHBlankIN(void) {
      }
      else {
        ScuRegs->timer0_set = 0;
-       if (TimerStreichAn() & 8) ScuRemoveTimer0();
+       ScuRemoveTimer0();
      }
 
      if (ScuRegs->timer1_set == 1) {
         ScuRegs->timer1_set = 0;
-        ScuRegs->timer1_counter = ScuRegs->timer1_preset;
-        if (TimerStreichAn() & 8) ScuRemoveTimer1();
+        ScuRegs->timer1_counter = ScuRegs->timer1_preset << 2;   /* quarter units */
+        ScuRemoveTimer1();
       }
    }
    ScuChekIntrruptDMA(2);
@@ -3549,14 +3629,14 @@ void ScuSendTimer1(void) {
 }
 
 void ScuRemoveTimer0(void) {
-  if (TimerStreichAn()) ScuRemoveInterrupt(0x43, 0x0C, 0x00000008);
+  ScuRemoveInterrupt(0x43, 0x0C, 0x00000008);
   //ScuRemoveInterrupt(0x43, 0x0C);
   //SH2RemoveInterrupt(MSH2, 0x43, 0x0C);
 }
 
 
 void ScuRemoveTimer1(void) {
-  if (TimerStreichAn()) ScuRemoveInterrupt(0x44, 0x0B, 0x00000010);
+  ScuRemoveInterrupt(0x44, 0x0B, 0x00000010);
   //ScuRemoveInterrupt(0x44, 0x0B);
   //SH2RemoveInterrupt(MSH2, 0x44, 0xB);
 }

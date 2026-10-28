@@ -38,8 +38,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <cstring>
 #include <vector>
 #include <string>
-// Forward declaration: the "Next Disc" button in the menu constructor uses this
-// helper, whose definition must follow `ends_with`.
+// used by the "Next Disc" button; defined further down, after ends_with()
 static std::vector<std::string> disc_list(const std::string & base_path);
 
 #include <experimental/filesystem>
@@ -61,6 +60,19 @@ using namespace std;
 #include "RetroAchievements.h"
 
 #include "yabause.h"
+#include "cheat.h"
+
+/* A popup button inside a popup: nanogui opens its popup to the right of the
+   parent popup, which pushes the wide slot lists off the 640 px screen. This
+   one opens its popup at the place of the parent popup instead. */
+class SubPopupButton : public PopupButton {
+public:
+  SubPopupButton(Widget *parent, const std::string &caption) : PopupButton(parent, caption) {}
+  void performLayout(NVGcontext *ctx) override {
+    PopupButton::performLayout(ctx);
+    popup()->setAnchorPos(Vector2i(0, popup()->anchorPos().y()));
+  }
+};
 
 //#define MENU_LOG
 #define MENU_LOG(...) do { } while (0)
@@ -117,6 +129,31 @@ MenuScreen::MenuScreen( SDL_Window* pwindow, int rwidth, int rheight, const std:
           pushActiveMenu(ps_config->popup(),ps_config); 
         });
 
+        /* Save and Load State share one submenu, so the main menu fits the screen. */
+        PopupButton * ps_save = new PopupButton(tools, "Save");
+        ps_save->setFixedWidth(248);
+        Popup * save_popup = ps_save->popup();
+        save_popup->setLayout(new GroupLayout(4,2,2,2));
+        ps_save->setCallback([this,ps_save]() {
+          pushActiveMenu(ps_save->popup(), ps_save);
+        });
+
+        PopupButton * ps = new SubPopupButton(save_popup, "Save State");
+        ps->setFixedWidth(160);
+        ps->setCallback([this,ps]() {
+          showSaveStateDialog( ps->popup());
+          pushActiveMenu(ps->popup(),ps);
+        });
+
+        ps = new SubPopupButton(save_popup, "Load State");
+        ps->setFixedWidth(160);
+        load_state_btn_ = ps;
+        ps->setCallback([this,ps]() {
+          if( RA_HardcoreActive() ) return;   /* disabled in hardcore mode */
+          showLoadStateDialog( ps->popup());
+          pushActiveMenu(ps->popup(),ps);
+        });
+
         Button *b0 = new Button(tools, "Exit");
         b0->setFixedWidth(248);
         b0->setCallback([this]() { 
@@ -146,6 +183,15 @@ MenuScreen::MenuScreen( SDL_Window* pwindow, int rwidth, int rheight, const std:
           pushActiveMenu(ps_sound->popup(), ps_sound);
         });
 
+        PopupButton * ps_cheat = new PopupButton(tools, "Cheats");
+        ps_cheat->setFixedWidth(248);
+        ps_cheat->setCallback([this,ps_cheat]() {
+          showCheatDialog(ps_cheat);
+          /* Hand over the inner container: pushActiveMenu looks for the first button only among
+             the direct children, and the popup's only child is the scroll panel. */
+          pushActiveMenu(cheat_wrapper_, ps_cheat);
+        });
+
         /* RetroAchievements login */
         PopupButton * ps_ra = new PopupButton(tools, "RetroAchievements");
         ps_ra->setFixedWidth(248);
@@ -154,24 +200,6 @@ MenuScreen::MenuScreen( SDL_Window* pwindow, int rwidth, int rheight, const std:
           raStatusUpdate(true);
           pushActiveMenu(ps_ra->popup(), ps_ra);
         });
-
-        PopupButton * ps = new PopupButton(tools, "Save State");
-        ps->setFixedWidth(248);
-        ps->setCallback([this,ps]() {      
-          showSaveStateDialog( ps->popup());
-          pushActiveMenu(ps->popup(),ps); 
-        });
-
-        ps = new PopupButton(tools, "Load State");
-        ps->setFixedWidth(248);
-        load_state_btn_ = ps;
-        ps->setCallback([this,ps]() {      
-          if( RA_HardcoreActive() ) return;   /* disabled in hardcore mode */
-          showLoadStateDialog( ps->popup());
-          pushActiveMenu(ps->popup(),ps); 
-        });
-
-
 
         bCdTray = new Button(tools, "Open CD Tray");
         bCdTray->setFixedWidth(248);
@@ -210,8 +238,8 @@ MenuScreen::MenuScreen( SDL_Window* pwindow, int rwidth, int rheight, const std:
 
         // "Next Disc": switch to the next image in the game directory with one click.
         // Multi-disc games are stored as separate .chd files in one directory.
-        // This is not an automatic switch: the Saturn gives no "insert disc 2"
-        // signal, the game only polls the disc-change flag.
+        // Manual disc change: the Saturn has no "insert disc 2" signal, the game
+        // only polls the disc-change flag.
         // With the HLE BIOS, closing the tray resets the system and boots the new disc
         // (YabauseReset in Cs2ForceCloseTray). With a real BIOS (-b) the system currently
         // drops to the BIOS menu; Start there boots the new disc (known issue).
@@ -229,32 +257,32 @@ MenuScreen::MenuScreen( SDL_Window* pwindow, int rwidth, int rheight, const std:
                      (int)discs.size(), base_path.c_str());
             return;
           }
-          size_t idx = 0; bool gefunden = false;
+          size_t idx = 0; bool found = false;
           for( size_t i = 0; i < discs.size(); i++ )
-            if( discs[i] == current_game_path_ ){ idx = i; gefunden = true; break; }
+            if( discs[i] == current_game_path_ ){ idx = i; found = true; break; }
           // Not found (game lies elsewhere than the list): start at 0.
-          size_t naechste = gefunden ? ((idx + 1) % discs.size()) : 0;
-          std::string ziel = discs[naechste];
-          MENU_LOG("Next Disc: %s -> %s\n", current_game_path_.c_str(), ziel.c_str());
+          size_t next_idx = found ? ((idx + 1) % discs.size()) : 0;
+          std::string goal = discs[next_idx];
+          MENU_LOG("Next Disc: %s -> %s\n", current_game_path_.c_str(), goal.c_str());
 
           // Tray open ...
-          SDL_Event ev_auf = {};
-          ev_auf.type = open_tray_;
-          ev_auf.user.code = 0; ev_auf.user.data1 = 0; ev_auf.user.data2 = 0;
-          SDL_PushEvent(&ev_auf);
+          SDL_Event ev_open = {};
+          ev_open.type = open_tray_;
+          ev_open.user.code = 0; ev_open.user.data1 = 0; ev_open.user.data2 = 0;
+          SDL_PushEvent(&ev_open);
           // ... and closed again with the next disc. Both events are handled in the
           // same pass of the main loop, as with the file dialog.
           SDL_Event ev_zu = {};
           ev_zu.type = close_tray_;
           ev_zu.user.code = 0;
-          ev_zu.user.data1 = malloc( (ziel.size()+1) * sizeof(char) );
-          strcpy( (char*)ev_zu.user.data1, ziel.c_str() );
+          ev_zu.user.data1 = malloc( (goal.size()+1) * sizeof(char) );
+          strcpy( (char*)ev_zu.user.data1, goal.c_str() );
           ev_zu.user.data2 = 0;
           SDL_PushEvent(&ev_zu);
 
           // Track the path here: main.cpp only calls setCurrentGamePath on
           // OpenTray, when cdpath is still the old path.
-          current_game_path_ = ziel;
+          current_game_path_ = goal;
 
           // Keep the menu consistent: the tray is closed again after the close event.
           this->is_cdtray_open_ = false;
@@ -394,68 +422,122 @@ static const int SNDVOL_SFX_N  = 7;
 
 extern "C" {
   void ScspSetCddaVolume(int v);
-  void SmpcSetSystemsprache(int id);
+  void SmpcSetSystemLanguage(int id);
   void ScspSetSfxVolume(int v);
 }
 
-static std::string sndvol_text(const char * name, int wert, bool cdda){
+static std::string sndvol_text(const char * name, int cur_value, bool cdda){
   char buf[64];
-  if (cdda && wert == 0) snprintf(buf, sizeof(buf), "%s:  Off", name);
-  else                   snprintf(buf, sizeof(buf), "%s:  %d%%", name, wert);
+  if (cdda && cur_value == 0) snprintf(buf, sizeof(buf), "%s:  Off", name);
+  else                   snprintf(buf, sizeof(buf), "%s:  %d%%", name, cur_value);
   return std::string(buf);
 }
 
-/* Step a slider by one level. richtung: -1 left, +1 right. */
-void MenuScreen::soundVolStep( nanogui::Button * b, int richtung ){
+/* Step a slider by one level. direction: -1 left, +1 right. */
+void MenuScreen::soundVolStep( nanogui::Button * b, int direction ){
   if (b == nullptr) return;
   /* `preference` is not a class member: showConfigDialog creates its own
      instance (via current_game_path_). Do the same here so the values land in
      the same game config. */
   std::shared_ptr<Preference> preference(new Preference( current_game_path_ ));
   const bool cdda = (b == snd_cdda_btn_);
-  const int * stufen = cdda ? SNDVOL_CDDA : SNDVOL_SFX;
+  const int * steps = cdda ? SNDVOL_CDDA : SNDVOL_SFX;
   const int n        = cdda ? SNDVOL_CDDA_N : SNDVOL_SFX_N;
   const char * key   = cdda ? "cd volume" : "sfx volume";
   const char * name  = cdda ? "CD Music" : "Sound Effects";
-  int jetzt = preference->getInt(key, 100);
+  int now_val = preference->getInt(key, 100);
   /* Pick the nearest level so values not exactly in the list snap cleanly. */
   int idx = 0;
   int best = -1;
   for (int i = 0; i < n; i++) {
-    const int d = (stufen[i] > jetzt) ? (stufen[i] - jetzt) : (jetzt - stufen[i]);
+    const int d = (steps[i] > now_val) ? (steps[i] - now_val) : (now_val - steps[i]);
     if (best < 0 || d < best) { best = d; idx = i; }
   }
-  idx += richtung;
+  idx += direction;
   if (idx < 0) idx = 0;
   if (idx >= n) idx = n - 1;
-  const int neu = stufen[idx];
-  if (neu == jetzt) return;
-  preference->setInt(key, neu);
-  if (cdda) ScspSetCddaVolume(neu); else ScspSetSfxVolume(neu);
-  b->setCaption(sndvol_text(name, neu, cdda));
+  const int new_val = steps[idx];
+  if (new_val == now_val) return;
+  preference->setInt(key, new_val);
+  if (cdda) ScspSetCddaVolume(new_val); else ScspSetSfxVolume(new_val);
+  b->setCaption(sndvol_text(name, new_val, cdda));
 }
 
 extern "C" int use_new_scsp;   /* scsp.c: the core the current game is running with */
-extern "C" int g_scsp_dspaus;  /* scsp.c: 1 = DSP off, switchable live */
-extern "C" int g_interhalb_menue;  /* vidogl.c: 1 = half-height interlaced backgrounds, live */
+extern "C" int g_scsp_dsp_off;  /* scsp.c: 1 = DSP off, switchable live */
+extern "C" int g_interlace_half_menu;  /* vidogl.c: 1 = half-height interlaced backgrounds, live */
 /* The selected entry is tinted green (tintToggle). DSP Off / DSP On
    (selected: 1 = DSP on) takes effect immediately, no restart needed. */
-void MenuScreen::soundKernZeigen( int gewaehlt ){
-  tintToggle(snd_kern_btn_, gewaehlt == 0);
-  tintToggle(snd_kern_neu_btn_, gewaehlt == 1);
-  if (snd_kern_hinweis_ != nullptr)
-    snd_kern_hinweis_->setCaption(" ");
+void MenuScreen::soundCoreShow( int selected ){
+  tintToggle(snd_core_btn_, selected == 0);
+  tintToggle(snd_core_new_btn_, selected == 1);
+  if (snd_core_hint_ != nullptr)
+    snd_core_hint_->setCaption(" ");
 }
 
-void MenuScreen::soundKernStep( int richtung ){
-  if (snd_kern_btn_ == nullptr) return;
+void MenuScreen::soundCoreStep( int direction ){
+  if (snd_core_btn_ == nullptr) return;
   std::shared_ptr<Preference> preference(new Preference( current_game_path_ ));
-  int jetzt = preference->getInt("sound dsp", 0) ? 1 : 0;
-  int neu = (richtung > 0) ? 1 : 0;
-  if (richtung == 0) neu = !jetzt;
-  if (neu != jetzt) preference->setInt("sound dsp", neu);
-  g_scsp_dspaus = neu ? 0 : 1;
-  soundKernZeigen(neu);
+  int now_val = preference->getIntOnlyGlobal("sound dsp", 1) ? 1 : 0;   /* global setting, not per game */
+  int new_val = (direction > 0) ? 1 : 0;
+  if (direction == 0) new_val = !now_val;
+  if (new_val != now_val) preference->setIntGlobal("sound dsp", new_val);
+  g_scsp_dsp_off = new_val ? 0 : 1;
+  soundCoreShow(new_val);
+}
+
+/* Cheats of the running game (libretro .cht, loaded in main.cpp). One entry = one group of
+   Action Replay codes (cheatN of the file, stored back to back); pressing it switches the group
+   at once, green = on. The choice is kept in the game config as "cheat <N>" and applied again
+   on the next start. Long lists scroll like the file selector. */
+void MenuScreen::showCheatDialog( PopupButton *parent ){
+  if (cheat_built_) return;
+  cheat_built_ = true;
+  std::shared_ptr<Preference> preference(new Preference( current_game_path_ ));
+  Popup *popup = parent->popup();
+  int popup_height = std::min(this->size()[1] - 40, 440);
+  popup->setFixedSize(Vector2i(300, popup_height));
+  auto vscroll = new VScrollPanel(popup);
+  vscroll->setFixedSize(Vector2i(300, popup_height));
+  Widget *wrapper = new Widget(vscroll);
+  wrapper->setFixedSize(Vector2i(300, popup_height));
+  wrapper->setLayout(new GroupLayout(4,2,2,2));
+  cheat_wrapper_ = wrapper;
+
+  /* RetroAchievements note at the top (a label; keyboard focus goes to the first button) */
+  static const char * const RA_OFF  = "Cheats activated -> RetroAchievements disabled";
+  static const char * const RA_NOTE = "A cheat disables RetroAchievements until reset";
+  RAStatus ra_st;
+  RA_GetStatus(ra_st);
+  Label *ra_hint = (ra_st.state == RA_LOGGED_IN) ? new Label(wrapper, ra_st.cheats ? RA_OFF : RA_NOTE) : nullptr;
+
+  int count = 0, last = -2, entries = 0;
+  cheatlist_struct *list = CheatGetList(&count);
+  for (int i = 0; list != NULL && i < count; i++) {
+    int g = list[i].group;
+    if (g < 0 || g == last) continue;
+    last = g;
+    entries++;
+    Button *b = new Button(wrapper, list[i].desc ? list[i].desc : "?");
+    b->setFlags(Button::ToggleButton);
+    b->setPushed(list[i].enable != 0);
+    MenuScreen::tintToggle(b, b->pushed());
+    b->setChangeCallback([this,preference,b,g,ra_hint](bool state) {
+      MenuScreen::tintToggle(b, state);
+      CheatEnableGroup(g, state ? 1 : 0);
+      preference->setBool("cheat " + std::to_string(g), state);
+      if (state) RA_CheatsUsed();   /* no achievements with cheats */
+      if (ra_hint != nullptr) {
+        RAStatus s;
+        RA_GetStatus(s);
+        ra_hint->setCaption(s.cheats ? RA_OFF : RA_NOTE);
+        performLayout();
+      }
+    });
+  }
+  if (entries == 0)
+    new Button(wrapper, "No cheats for this game");   /* a button, not a label: the page needs something focusable */
+  performLayout();
 }
 
 /* "Sound Volume": the two sliders, adjusted with left/right on the d-pad
@@ -477,12 +559,12 @@ void MenuScreen::showSoundDialog( PopupButton *parent ){
   snd_sfx_btn_->setCallback([this](){ soundVolStep(snd_sfx_btn_, +1); });
 
   /* two entries plus a hint line below */
-  snd_kern_btn_ = new Button(popup, "DSP Off (less heat, no reverb)");
-  snd_kern_btn_->setCallback([this](){ soundKernStep(-1); });
-  snd_kern_neu_btn_ = new Button(popup, "DSP On (more heat, reverb)");
-  snd_kern_neu_btn_->setCallback([this](){ soundKernStep(+1); });
-  snd_kern_hinweis_ = new Label(popup, " ");
-  soundKernZeigen(preference->getInt("sound dsp", 0) ? 1 : 0);
+  snd_core_btn_ = new Button(popup, "DSP Off (less heat, no reverb)");
+  snd_core_btn_->setCallback([this](){ soundCoreStep(-1); });
+  snd_core_new_btn_ = new Button(popup, "DSP On (more heat, reverb)");
+  snd_core_new_btn_->setCallback([this](){ soundCoreStep(+1); });
+  snd_core_hint_ = new Label(popup, " ");
+  soundCoreShow(preference->getIntOnlyGlobal("sound dsp", 1) ? 1 : 0);
 }
 
 /* "RetroAchievements": status line, Login / Logout. */
@@ -641,6 +723,7 @@ void MenuScreen::raStatusUpdate( bool force ){
   if( st.state == RA_LOGGED_IN && st.game_loaded ){
     std::stringstream ss;
     ss << "\n" << st.game_title << ": " << st.ach_unlocked << "/" << st.ach_total;
+    if( st.cheats ) ss << "\nCheats activated -> RetroAchievements disabled\n(reset without cheats to enable them)";
     t += ss.str();
   }
   if( ra_mode_btn_ != nullptr ){
@@ -934,7 +1017,7 @@ void MenuScreen::showConfigDialog( PopupButton *parent ){
   cb->setCallbackSelect([this,preference]( int idx ) {
     popActiveMenu();
     preference->setInt("system language", idx);
-    SmpcSetSystemsprache(idx);
+    SmpcSetSystemLanguage(idx);
   });
 
   new Label(popup, "Rotate screen resolution");
@@ -982,9 +1065,9 @@ void MenuScreen::showConfigDialog( PopupButton *parent ){
   bih->setChangeCallback([this,preference,bih](bool state) {
     MenuScreen::tintToggle(bih, state);
     preference->setInt("interlace half", state ? 1 : 0);
-    g_interhalb_menue = state ? 1 : 0;
+    g_interlace_half_menu = state ? 1 : 0;
   });
-  cfg_interhalb_btn_ = bih;
+  cfg_interlace_half_btn_ = bih;
 
 
 
@@ -1003,10 +1086,8 @@ void MenuScreen::showConfigDialog( PopupButton *parent ){
 }
 
 void MenuScreen::tintToggle( Button * b, bool on ){
-  // Make enabled toggle buttons recognisable at a glance. The theme gradient
-  // covers the background colour of pressed buttons by 80%, so mostly the text
-  // colour carries the state; the green background adds a tint. Disabled =
-  // theme default (Color(0,0)).
+  // Green text and background for "on"; the theme gradient covers most of the
+  // background colour, so the text colour carries the state. Off = theme default.
   if( b == nullptr ) return;
   if( on ){
     b->setTextColor( Color(140, 255, 140, 255) );
@@ -1018,12 +1099,9 @@ void MenuScreen::tintToggle( Button * b, bool on ){
 }
 
 void MenuScreen::refreshConfigSwitches(){
-  // showConfigDialog() builds the comboboxes/buttons only once, in the
-  // MenuScreen constructor, before yabauseinit() and before any later change
-  // to the preference files. When the menu is opened (main.cpp, evToggleMenu)
-  // the preference file is re-read here and only mirrored into the widgets
-  // (setPushed()/setSelectedIndex()); no preference->setXXX()/VideoSetSetting()
-  // calls are made, those stay with the existing callbacks.
+  // The widgets are built once in the constructor; on every menu open the
+  // game config is re-read and only mirrored into them. Settings are still
+  // written by the widget callbacks alone.
   if( load_state_btn_ != nullptr ) load_state_btn_->setEnabled( !RA_HardcoreActive() );
   if( cfg_compute_shader_btn_ == nullptr ) return;
 
@@ -1040,9 +1118,9 @@ void MenuScreen::refreshConfigSwitches(){
   }
   cfg_compute_shader_btn_->setPushed( preference->getBool("Use compute shader", true) );
   MenuScreen::tintToggle( cfg_compute_shader_btn_, cfg_compute_shader_btn_->pushed() );
-  if( cfg_interhalb_btn_ != nullptr ){
-    cfg_interhalb_btn_->setPushed( preference->getInt("interlace half", 0) != 0 );
-    MenuScreen::tintToggle( cfg_interhalb_btn_, cfg_interhalb_btn_->pushed() );
+  if( cfg_interlace_half_btn_ != nullptr ){
+    cfg_interlace_half_btn_->setPushed( preference->getInt("interlace half", 0) != 0 );
+    MenuScreen::tintToggle( cfg_interlace_half_btn_, cfg_interlace_half_btn_->pushed() );
   }
   if( cfg_rotate_screen_btn_ != nullptr ){
     cfg_rotate_screen_btn_->setPushed( preference->getBool("Rotate screen", false) );
@@ -1162,6 +1240,12 @@ void MenuScreen::showLoadStateDialog( Popup *popup ){
       });
     }
   }
+  /* No slot saved yet: show a note instead of an empty popup, so the focus has
+     a button to land on and A or B leads back to the Save menu. */
+  if( popup->childCount() == 0 ){
+    Button *none = new Button(popup, "No save state found");
+    none->setCallback([this]() { popActiveMenu(); });
+  }
   this->performLayout();
 
 }
@@ -1279,14 +1363,9 @@ void MenuScreen::setupPlayerPsuhButton( int user_index, PopupButton *player, con
   player->setFixedWidth(248);
   Popup *popup = player->popup();
 
-  // This popup holds a label, 17 key-mapping buttons and the "Analog mode"
-  // toggle (19 widgets). Without a size limit it stays at the PopupButton
-  // default size (320x250) while GroupLayout keeps drawing the widgets unclipped,
-  // so on a 640x480 screen the last buttons run off the bottom. As in
-  // showFileSelectDialog(), the popup gets exactly one child (a VScrollPanel,
-  // stretched to the popup size by Popup::performLayout); its content wrapper
-  // can grow arbitrarily and scrolls. The focus navigation in keyboardEvent()
-  // keeps the selection visible by moving the scroll offset.
+  // 19 widgets do not fit on a 640x480 screen: as in showFileSelectDialog(),
+  // the popup holds a single VScrollPanel, and keyboardEvent() scrolls the
+  // focused button into view.
   int popup_height = std::min(this->size()[1] - 40, 440);
   popup->setFixedSize(Vector2i(260, popup_height));
   auto vscroll = new VScrollPanel(popup);
@@ -1604,12 +1683,12 @@ bool MenuScreen::keyboardEvent( std::string & keycode , int scancode, int action
       nanogui::Button* fb = dynamic_cast<nanogui::Button*>(mFocus);
       if (fb != nullptr && (fb == snd_cdda_btn_ || fb == snd_sfx_btn_))
         soundVolStep(fb, -1);
-      else if (fb != nullptr && (fb == snd_kern_btn_ || fb == snd_kern_neu_btn_)) soundKernStep(-1);
+      else if (fb != nullptr && (fb == snd_core_btn_ || fb == snd_core_new_btn_)) soundCoreStep(-1);
     }else if ( keycode.find("right") != string::npos ) {
       nanogui::Button* fb = dynamic_cast<nanogui::Button*>(mFocus);
       if (fb != nullptr && (fb == snd_cdda_btn_ || fb == snd_sfx_btn_))
         soundVolStep(fb, +1);
-      else if (fb != nullptr && (fb == snd_kern_btn_ || fb == snd_kern_neu_btn_)) soundKernStep(+1);
+      else if (fb != nullptr && (fb == snd_core_btn_ || fb == snd_core_new_btn_)) soundCoreStep(+1);
     }
 
     if (keycode == "a") {

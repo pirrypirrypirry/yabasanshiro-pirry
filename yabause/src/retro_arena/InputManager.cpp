@@ -24,7 +24,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 //#include "Window.h"
 //#include "Log.h"
 #include "pugixml/pugixml.hpp"
-#include <boost/filesystem.hpp>
+#include <sys/stat.h>
 //#include "platform.h"
 #include <iostream>
 
@@ -84,7 +84,11 @@ static const unsigned int SDL_HAT_VALUES_NUM = sizeof(SDL_HAT_VALUES) / sizeof(S
 // 4. Joystick GUID - this is some squashed version of joystick vendor, version, and a bunch of other device-specific things.
 //    It should remain the same across runs of the program/system restarts/device reordering and is what I use to identify which joystick to load.
 
-namespace fs = boost::filesystem;
+/* exists() was the only boost::filesystem call in the tree; stat() answers the same question
+   and drops the libboost_filesystem.so.1.83 dependency (older systems such as Ubuntu-based ArkOS lack it). */
+namespace fs {
+  inline bool exists( const std::string & p ){ struct stat st; return stat(p.c_str(), &st) == 0; }
+}
 
 InputManager* InputManager::mInstance = NULL;
 void genJoyString( string & out, SDL_JoystickID id, const string & name, const string & guid );
@@ -217,22 +221,10 @@ int setDefalutSettings( void * padbits ){
     return 0;
 }
 
-// mapKeys() only sets PerSetKey() (the emulator core path via padbits).
-// InputConfig::mNameMap is otherwise filled only by InputConfig::loadFromXML()
-// from ~/.emulationstation/es_temporaryinput.cfg, which this fork never writes,
-// and the InputConfig constructor is empty. mNameMap would therefore be empty
-// for every device and getInputByName("select"/"start") would always return
-// id=-1, so the menu select could never fire. The "select"/"start" values read
-// from keymapv3.json are mirrored into the device's InputConfig name map, i.e.
-// the two names that updateConfig()/init() query for menu_inputs_.
-
-// Once the menu is open, navigation goes through
-// InputManager::parseEventMenu() -> InputConfig::getMappedTo(), which searches
-// the same mNameMap and finds nothing for "up"/"down"/"left"/"right"
-// (hat-, button- or axis-based d-pad, depending on the pad). The same
-// mechanism as for select/start is therefore extended to the four direction
-// names; they are taken 1:1 from the device's keymapv3.json entry (type/id/value)
-// rather than from guessed SDL enum constants. No auto-repeat timer.
+// mapKeys() only feeds the emulator core (PerSetKey). The menu looks inputs up
+// by name in InputConfig::mNameMap, which nothing else fills in this port, so
+// "select"/"start" and the four directions are copied from the device's
+// keymapv3.json entry (type/id/value) into that map.
 
 static InputType jsonTypeToInputType( const std::string & t ){
   if( t == "axis" ) return TYPE_AXIS;
@@ -684,37 +676,37 @@ void InputManager::init( const std::string & fname )
 
   json j;
   config_fname_ = fname;
-  bool km_neu = !fs::exists(fname);
+  bool km_new = !fs::exists(fname);
   /* An existing but unusable keymapv2.json (unreadable, or no button assigned,
      all ids -1) is moved aside (.broken) and regenerated. Axes do not count as
      an assignment. */
-  if (!km_neu) {
+  if (!km_new) {
     {
-      int belegt = -1;
+      int taken = -1;
       try {
         std::ifstream f0(fname);
         json t;
         f0 >> t;
-        belegt = 0;
+        taken = 0;
         for (auto it = t.begin(); it != t.end(); ++it) {
           if (it.key().rfind("player", 0) == 0 || !it.value().is_object()) continue;
           for (auto b = it.value().begin(); b != it.value().end(); ++b) {
             if (!b.value().is_object()) continue;
             if (b.value().value("type", std::string("")) == "axis") continue;
-            if (b.value().value("id", -1) >= 0) belegt++;
+            if (b.value().value("id", -1) >= 0) taken++;
           }
         }
       } catch (...) {
-        belegt = -1;
+        taken = -1;
       }
-      if (belegt <= 0) {
-        std::string weg = fname + ".broken";
-        rename(fname.c_str(), weg.c_str());
-        km_neu = true;
+      if (taken <= 0) {
+        std::string gone = fname + ".broken";
+        rename(fname.c_str(), gone.c_str());
+        km_new = true;
       }
     }
   }
-  if(km_neu){
+  if(km_new){
     if( convertFromEmustationFile(fname) != 0 ){
       return;
     }

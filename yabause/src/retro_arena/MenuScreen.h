@@ -145,15 +145,19 @@ public:
     /* "Sound Volume" submenu with two sliders, adjusted with left/right on the
        d-pad. The button pointers are kept so keyboardEvent can recognise them. */
     void showSoundDialog( PopupButton *popup );
-    void soundVolStep( nanogui::Button * b, int richtung );
+    void soundVolStep( nanogui::Button * b, int direction );
     nanogui::Button * snd_cdda_btn_ = nullptr;
     nanogui::Button * snd_sfx_btn_  = nullptr;
     /* Sound core selection (classic/new); takes effect on the next game start. */
-    void soundKernStep( int richtung );
-    nanogui::Button * snd_kern_btn_ = nullptr;
-    nanogui::Button * snd_kern_neu_btn_ = nullptr;   /* second entry "New Sound Core" (snd_kern_btn_ = "Old") */
-    nanogui::Label * snd_kern_hinweis_ = nullptr;    /* "needs emu restart" line below */
-    void soundKernZeigen( int gewaehlt );
+    void soundCoreStep( int direction );
+    nanogui::Button * snd_core_btn_ = nullptr;
+    nanogui::Button * snd_core_new_btn_ = nullptr;   /* second entry "New Sound Core" (snd_core_btn_ = "Old") */
+    nanogui::Label * snd_core_hint_ = nullptr;    /* "needs emu restart" line below */
+    void soundCoreShow( int selected );
+    /* "Cheats" page, built on first open (the list exists only after yabauseinit) */
+    void showCheatDialog( PopupButton *popup );
+    bool cheat_built_ = false;
+    nanogui::Widget * cheat_wrapper_ = nullptr;   /* container holding the buttons, for pushActiveMenu */
     void refreshConfigSwitches();
     /* RetroAchievements login: status dialog + on-screen keyboard (d-pad). */
     void showRetroAchievementsDialog( PopupButton *popup );
@@ -217,7 +221,7 @@ protected:
     ComboBox *cfg_aspect_cb_ = nullptr;
     ComboBox *cfg_rotate_res_cb_ = nullptr;
     Button *cfg_compute_shader_btn_ = nullptr;
-    Button *cfg_interhalb_btn_ = nullptr;
+    Button *cfg_interlace_half_btn_ = nullptr;
     Button *cfg_rotate_screen_btn_ = nullptr;
 
 };

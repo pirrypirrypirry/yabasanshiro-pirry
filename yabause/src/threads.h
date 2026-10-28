@@ -108,7 +108,7 @@ int YabClearEventQueue(YabEventQueue * queue_t);
    entry was dropped. Only valid where entries are plain wake-up tokens and the
    consumer drains the whole queue; do not use for queues where every entry has
    its own meaning. */
-int YabAddEventQueueNichtBlockend( YabEventQueue * queue_t, int evcode );
+int YabAddEventQueueNonBlocking( YabEventQueue * queue_t, int evcode );
 
 typedef void * YabMutex;
 
@@ -118,8 +118,7 @@ YabMutex * YabThreadCreateMutex();
 void YabThreadFreeMutex( YabMutex * mtx );
 
 void YabThreadSetCurrentThreadAffinityMask(int mask);
-void YabThreadSetAffinityRoh(unsigned int maske);
-int  YabaKernModus(void);
+void YabThreadSetAffinityRaw(unsigned int mask_val);
 int YabThreadGetCurrentThreadAffinityMask();
 
 void YabThreadUSleep( unsigned int stime );

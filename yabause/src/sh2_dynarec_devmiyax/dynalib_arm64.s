@@ -2405,12 +2405,12 @@ memGetByteFast5:
 // Block chaining.
 // epilogue_k / PageFlip_k are the same size as epilogue (10*4) / PageFlip
 // (11*4) and replace them when a block is translated. They jump through
-// [x19,#216] (kette_ziel) into kette_stub, because the block code lives in an
+// [x19,#216] (chain_target) into chain_stub, because the block code lives in an
 // mmap area and a direct b would be out of range.
 // Register state at block exit: x19 tagSH2, w20 PC, w21 COUNT, w25 exitcount
 // (= targetcnt of the time slice), w26 SR; 80-byte stack frame from the prolog.
 // Offsets: SR 64, PC 88, COUNT 92, ICOUNT 96, memcycle 192, lookup_hw 200,
-// cur_block 208, kette_ziel 216 (static_assert in DynarecSh2.h),
+// cur_block 208, chain_target 216 (static_assert in DynarecSh2.h),
 // Block.flags 2060, PROLOGSIZE 44.
 // ===================================================================
 .section .text
@@ -2448,10 +2448,10 @@ PageFlip_k:
 1:
 .size PageFlip_k, .-PageFlip_k
 
-// Delayed branch exits through kette_stub.
+// Delayed branch exits through chain_stub.
 // Same size as seperator_delay_slot (15*4) / seperator_delay_after (12*4).
 // Register state as for epilogue_k/PageFlip_k (x19 tagSH2, w20 PC, w21 COUNT,
-// w25 exitcount, w26 SR, 80-byte frame); kette_stub itself stores PC/COUNT/SR
+// w25 exitcount, w26 SR, 80-byte frame); chain_stub itself stores PC/COUNT/SR
 // (hit and fallback path). The cycle slot of _after stays at offset 8.
 .align 4
 .global seperator_delay_slot_k
@@ -2461,7 +2461,7 @@ seperator_delay_slot_k:
   add  w20, w20, #2        // 4   not taken: PC = delay slot = next block
   add  w21, w21, #1        // 8   as original (unpatched)
   ldr  x9, [x19, #216]     // 12
-  br   x9                  // 16  -> kette_stub
+  br   x9                  // 16  -> chain_stub
   nop                      // 20
   nop                      // 24
   nop                      // 28
@@ -2475,7 +2475,7 @@ seperator_delay_slot_k:
   sub  w20, w20, #2        // 56  PC -= 2, continue into the delay-slot instruction
 .size seperator_delay_slot_k, .-seperator_delay_slot_k
 .if (. - seperator_delay_slot_k) != 60
-.error "KETTE2B: seperator_delay_slot_k muss 15*4 Byte haben"
+.error "seperator_delay_slot_k must be 15*4 bytes"
 .endif
 
 .align 4
@@ -2483,10 +2483,10 @@ seperator_delay_slot_k:
 .type seperator_delay_after_k, %function
 seperator_delay_after_k:
   add  w20, w20, #2        // 0   PC = branch target
-  nop                      // 4   (STR_PC is done by kette_stub)
+  nop                      // 4   (STR_PC is done by chain_stub)
   add  w21, w21, #1        // 8   cycle slot (EmmitCode patches the cycle count in here)
   ldr  x9, [x19, #216]     // 12
-  br   x9                  // 16  -> kette_stub
+  br   x9                  // 16  -> chain_stub
   nop                      // 20
   nop                      // 24
   nop                      // 28
@@ -2496,13 +2496,13 @@ seperator_delay_after_k:
   nop                      // 44
 .size seperator_delay_after_k, .-seperator_delay_after_k
 .if (. - seperator_delay_after_k) != 48
-.error "KETTE2B: seperator_delay_after_k muss 12*4 Byte haben"
+.error "seperator_delay_after_k must be 12*4 bytes"
 .endif
 
 .align 4
-.global kette_stub
-.type kette_stub, %function
-kette_stub:
+.global chain_stub
+.type chain_stub, %function
+chain_stub:
   ldr  x9,  [x19, #208]          // cur_block
   ldr  w10, [x9, #2060]          // flags
   tbnz w10, #0, 9f               // BLOCK_LOOP -> C (idle-skip branch)
@@ -2540,4 +2540,4 @@ kette_stub:
   ldp  x25, x26, [sp,#64]
   add  sp, sp, #80
   ret
-.size kette_stub, .-kette_stub
+.size chain_stub, .-chain_stub

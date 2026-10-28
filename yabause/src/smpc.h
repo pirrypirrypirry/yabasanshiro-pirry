@@ -89,7 +89,7 @@ int SmpcInit(u8 regionid, int clocksync, u32 basetime);
 void SmpcDeInit(void);
 void SmpcRecheckRegion(void);
 void SmpcReset(void);
-void SmpcSetSystemsprache(int id);
+void SmpcSetSystemLanguage(int id);
 void SmpcResetButton(void);
 void SmpcExec(s32 t);
 void SmpcINTBACKEnd(void);

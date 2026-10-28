@@ -47,7 +47,6 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <stdlib.h>
 #include "yabause.h"
 #include "vdp1.h"
-#include "instrument.h"
 #include "debug.h"
 #include "scu.h"
 #include "vdp2.h"
@@ -57,6 +56,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
+extern "C" { extern volatile int g_ptmr_this_frame; }   /* vdp2.cpp */
 
 
 using std::atomic;
@@ -84,7 +84,7 @@ static u8 * Vdp1RamSnap = NULL;
 vidogl.c) and are written by the SH2 and read by the renderer, so they are
 snapshotted together with the RAM. If a game changed them mid-draw the geometry
 would jump within a frame. */
-int Vdp1RenderRegsGueltig = 0;
+int Vdp1RenderRegsValid = 0;
 u16 Vdp1RenderTVMR = 0;
 u16 Vdp1RenderFBCR = 0;
 
@@ -92,39 +92,36 @@ u16 Vdp1RenderFBCR = 0;
 256 KB L2 twice. Every VDP1 write therefore marks its 4 KB page (128 pages), and
 the snapshot copies only the marked ones. Deliberately not hooked into
 Vdp1MarkVramWrite(), whose bookkeeping depends on g_texcache_persist. */
-#define V1SNAP_SEITEN 128            /* 0x80000 / 4096 */
-static u8  v1_snap_dirty[V1SNAP_SEITEN];
-static int v1_snap_alles = 1;        /* erster Schnappschuss: alles kopieren */
+#define V1SNAP_PAGES 128            /* 0x80000 / 4096 */
+static u8  v1_snap_dirty[V1SNAP_PAGES];
+static int v1_snap_all = 1;        /* first snapshot: copy everything */
 
 /* Mark everything as changed after reset and savestate load, since Vdp1Ram is
 overwritten there without going through the write functions. */
-extern "C" void Vdp1RamSnapAllesNeu(void) { v1_snap_alles = 1; }
+extern "C" void Vdp1RamSnapAllNew(void) { v1_snap_all = 1; }
 
 /* Shared by both drawing paths: the VBlank-OUT path (vdp2.cpp) and the immediate
 draw path via PTMR=1 / VDPEV_DIRECT_DRAW (further down in this file). */
 extern "C" void Vdp1RamSnapshot(void) {
-   static int snap_an = -1;
-   if (snap_an < 0) snap_an = 1;   /* fixed on */
-   if (!snap_an) return;
    if (Vdp1RamSnap == NULL || Vdp1Ram == NULL) return;
-   if (v1_snap_alles) {
+   if (v1_snap_all) {
       memcpy(Vdp1RamSnap, Vdp1Ram, 0x80000);
-      v1_snap_alles = 0;
+      v1_snap_all = 0;
       memset(v1_snap_dirty, 0, sizeof(v1_snap_dirty));
    } else {
-/* copy contiguous runs in one go; much faster than 128 separate memcpy calls */
+/* copy contiguous runs in one go instead of 128 separate memcpy calls */
       u32 i = 0;
-      while (i < V1SNAP_SEITEN) {
+      while (i < V1SNAP_PAGES) {
          if (!v1_snap_dirty[i]) { i++; continue; }
          u32 a = i;
-         while (i < V1SNAP_SEITEN && v1_snap_dirty[i]) { v1_snap_dirty[i] = 0; i++; }
+         while (i < V1SNAP_PAGES && v1_snap_dirty[i]) { v1_snap_dirty[i] = 0; i++; }
          memcpy(Vdp1RamSnap + (a << 12), Vdp1Ram + (a << 12), (size_t)(i - a) << 12);
       }
    }
 /* also take the two geometry-relevant registers */
    Vdp1RenderTVMR = Vdp1Regs->TVMR;
    Vdp1RenderFBCR = Vdp1Regs->FBCR;
-   Vdp1RenderRegsGueltig = 1;
+   Vdp1RenderRegsValid = 1;
    Vdp1RamRender = Vdp1RamSnap;
 }
 u8 * Vdp1FrameBuffer[2];
@@ -438,21 +435,22 @@ extern "C" void VideoDeInit(void) {
    only in diagnostic builds). Evaluated and reset once per second in vdp2.cpp; the
    data race is harmless since it is only a heuristic. */
 
-unsigned int g_v1_gezeichnet = 0;
+unsigned int g_v1_drawn = 0;
 
 
-extern unsigned int fbcr_schreib;
-extern unsigned int fbcr_letzt;
-extern unsigned int ptmr_schreib;
-extern unsigned int ptmr_letzt;
 
 extern "C" void Vdp1Reset(void) {
   /* Flush the VDP1 texture-cache stamps so that no cache entry is considered
      clean after a reset or savestate load. */
   Vdp1TexStampFlush();
-  Vdp1RamSnapAllesNeu();
+  Vdp1RamSnapAllNew();
   /* Vdp1Regs is a pointer, so sizeof(Vdp1Regs) would clear only a few fields; clear
      the whole structure (the buffer comes from malloc). */
+  /* EWDR/EWLR/EWRR survive a reset (e.g. CKCHG) (Ymir); the first call still
+     clears them (malloc leftovers). */
+  static int vdp1_reset_count = 0;
+  const u32 keep_ewdr = Vdp1Regs->EWDR, keep_ewlr = Vdp1Regs->EWLR, keep_ewrr = Vdp1Regs->EWRR;
+  const int keep_ew = (vdp1_reset_count++ > 0);
   memset(Vdp1Regs, 0, sizeof(Vdp1));
    Vdp1Regs->PTMR = 0;
    Vdp1Regs->MODR = 0x1000; // VDP1 Version 1
@@ -461,6 +459,9 @@ extern "C" void Vdp1Reset(void) {
    Vdp1Regs->EWLR = 0;
    Vdp1Regs->EWRR = 0;
    Vdp1Regs->ENDR = 0;
+   if (keep_ew) {
+      Vdp1Regs->EWDR = keep_ewdr; Vdp1Regs->EWLR = keep_ewlr; Vdp1Regs->EWRR = keep_ewrr;
+   }
    VIDCore->Vdp1Reset();
 
    Vdp1Regs->userclipX1 = 0;
@@ -490,8 +491,8 @@ extern "C" int VideoSetSetting( int type, int value )
 
 extern "C" u8 FASTCALL Vdp1ReadByte(u32 addr) {
    addr &= 0xFF;
-   LOG("trying to byte-read a Vdp1 register\n");
-   return 0;
+   /* byte from the 16-bit register (Ymir) */
+   return (u8)(Vdp1ReadWord(addr & ~1u) >> ((~addr & 1) * 8));
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -529,9 +530,13 @@ extern "C" u32 FASTCALL Vdp1ReadLong(u32 addr) {
 
 //////////////////////////////////////////////////////////////////////////////
 
-extern "C" void FASTCALL Vdp1WriteByte(u32 addr, UNUSED u8 val) {
+extern "C" void FASTCALL Vdp1WriteByte(u32 addr, u8 val) {
    addr &= 0xFF;
-   LOG("trying to byte-write a Vdp1 register - %08X\n", addr);
+   /* read-modify-write of the 16-bit register (Ymir) */
+   const u16 shift = (u16)((~addr & 1) * 8);
+   u16 word = Vdp1ReadWord(addr & ~1u);
+   word = (u16)((word & ~(0xFF << shift)) | ((u16)val << shift));
+   Vdp1WriteWord(addr & ~1u, word);
 }
 
 extern YabEventQueue * vdp1_rcv_evqueue;
@@ -549,7 +554,6 @@ extern "C" void FASTCALL Vdp1WriteWord(u32 addr, u16 val) {
     case 0x2:
       FRAMELOG("[VDP1] Write FCM=%d FCT=%d line = %d", (val & 0x02) >> 1, (val & 0x01), yabsys.LineCount);
       Vdp1Regs->FBCR = val;
-      INSTR(fbcr_schreib++); INSTR(fbcr_letzt = (unsigned int)(val & 0xFF));
       if ((Vdp1Regs->FBCR & 3) == 3) {
         //FRAMELOG("[VDP1] FCBR swtich to manual change");
         Vdp1External.manualchange = 1;
@@ -564,17 +568,11 @@ extern "C" void FASTCALL Vdp1WriteWord(u32 addr, u16 val) {
       //Vdp1Regs->COPR = 0;
       //printf("COPR = 0 at %d\n", __LINE__);
       Vdp1Regs->PTMR = val;
-      INSTR(ptmr_schreib++); INSTR(ptmr_letzt = (unsigned int)(val & 0xFF));
 #if YAB_ASYNC_RENDERING
       if (val == 1){ 
+        g_ptmr_this_frame = 1;   /* VOUT dispatch ordering, see Vdp2HBlankOUT */
         FRAMELOG("[VDP1] VDPEV_DIRECT_DRAW %d/%d", YaGetQueueSize(vdp1_rcv_evqueue), yabsys.LineCount);
         {
-#ifdef YABA_INSTRUMENT
-          extern unsigned long long g_eb_ptmr_ns;
-          extern unsigned int g_eb_ptmr_n;
-          g_eb_ptmr_n++;
-          struct timespec _p0, _p1; clock_gettime(CLOCK_MONOTONIC, &_p0);
-#endif
           { extern void Vdp1JoinPendingRendersC(void); Vdp1JoinPendingRendersC(); }
           if ( YaGetQueueSize(vdp1_rcv_evqueue) > 0){
             yabsys.wait_line_count = -1;
@@ -582,11 +580,6 @@ extern "C" void FASTCALL Vdp1WriteWord(u32 addr, u16 val) {
               YabWaitEventQueue(vdp1_rcv_evqueue);
             } while (YaGetQueueSize(vdp1_rcv_evqueue) != 0);
           }
-#ifdef YABA_INSTRUMENT
-          clock_gettime(CLOCK_MONOTONIC, &_p1);
-          g_eb_ptmr_ns += (unsigned long long)(_p1.tv_sec - _p0.tv_sec) * 1000000000ULL
-                        + (unsigned long long)(_p1.tv_nsec - _p0.tv_nsec);
-#endif
         }
         Vdp1Regs->EDSR >>= 1;
         yabsys.wait_line_count = yabsys.LineCount + 50;
@@ -693,30 +686,30 @@ extern "C" void Vdp1DrawCommands(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       if (!(command & 0x4000)) { // if (!skip)
          switch (command & 0x000F) {
          case 0: // normal sprite draw
-            g_v1_gezeichnet++;
+            g_v1_drawn++;
             VIDCore->Vdp1NormalSpriteDraw(ram, regs, back_framebuffer);
             break;
          case 1: // scaled sprite draw
-            g_v1_gezeichnet++;
+            g_v1_drawn++;
             VIDCore->Vdp1ScaledSpriteDraw(ram, regs, back_framebuffer);
             break;
          case 2: // distorted sprite draw
          case 3: /* this one should be invalid, but some games
                  (Hardcore 4x4 for instance) use it instead of 2 */
-            g_v1_gezeichnet++;
+            g_v1_drawn++;
             VIDCore->Vdp1DistortedSpriteDraw(ram, regs, back_framebuffer);
             break;
          case 4: // polygon draw
-            g_v1_gezeichnet++;
+            g_v1_drawn++;
             VIDCore->Vdp1PolygonDraw(ram, regs, back_framebuffer);
             break;
          case 5: // polyline draw
          case 7: // undocumented mirror
-            g_v1_gezeichnet++;
+            g_v1_drawn++;
             VIDCore->Vdp1PolylineDraw(ram, regs, back_framebuffer);
             break;
          case 6: // line draw
-            g_v1_gezeichnet++;
+            g_v1_drawn++;
             VIDCore->Vdp1LineDraw(ram, regs, back_framebuffer);
             break;
          case 8: // user clipping coordinates
@@ -788,7 +781,7 @@ extern "C" void Vdp1DrawCommands(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       command_count++;
       /* Four completely empty command slots in a row mean the table has run
          on into unused VDP1 RAM. Real hardware never gets that far within
-         its drawing time, but without a VDP1 cycle budget we would go on
+         its drawing time, but without a VDP1 cycle budget the emulator would go on
          and draw the random data behind it (Batsugun: noise and a dark band
          in the top part of the screen). Treat it as the end of the list.
          A single empty slot is legal (Time Bokan starts its list with one). */
@@ -1057,7 +1050,7 @@ extern "C" int Vdp1LoadState(FILE *fp, UNUSED int version, int size)
    yread(&check, (void *)Vdp1Ram, 0x80000, 1, fp);
    /* VRAM was loaded bypassing the write handlers, so flush the page stamps and resnapshot. */
    Vdp1TexStampFlush();
-  Vdp1RamSnapAllesNeu();
+  Vdp1RamSnapAllNew();
 
 #ifdef IMPROVED_SAVESTATES
 

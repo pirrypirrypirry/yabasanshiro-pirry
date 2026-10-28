@@ -46,7 +46,6 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <time.h>
 #include "vdp2.h"
 #include "debug.h"
-#include "instrument.h"
 #include "peripheral.h"
 #include "scu.h"
 #include "sh2core.h"
@@ -78,7 +77,17 @@ u8 A1_Updated = 0;
 u8 B0_Updated = 0;
 u8 B1_Updated = 0;
 
-u8 * Vdp2RamRender = NULL;        /* VDP2 RAM as read by the render thread (same as Vdp2Ram) */
+u8 * Vdp2RamRender = NULL;        /* VDP2 RAM as read by the render thread (snapshot of Vdp2Ram, see Vdp2RamSnapshot) */
+/* VDP2 VRAM snapshot: at the VOUT dispatch the 4 KB pages written since the previous dispatch are copied into a second
+   buffer and the render thread reads that copy. Without it the emulation thread could rewrite line scroll tables and
+   tile maps while the previous frame is still being drawn, so the drawn frame mixed old and new data (Earthworm Jim 2:
+   background judder). Only a few pages change per frame (about 4-5 of 128), the copy is cheap. */
+#define V2SNAP_PAGES 128
+static u8 *Vdp2RamSnap = NULL;
+static u8 v2snap_dirty[V2SNAP_PAGES];
+static int v2snap_all = 1;
+/* Set by the VDP1 PTMR=1 write (vdp1.cpp); see the VOUT dispatch in Vdp2HBlankOUT. */
+extern "C" { volatile int g_ptmr_this_frame = 0; }
 
 struct CellScrollData cell_scroll_data[270];
 Vdp2 Vdp2Lines[270];
@@ -91,21 +100,13 @@ static Vdp2 Vdp2LinesSnap[270];
 Vdp2 * Vdp2LinesRender = Vdp2Lines;   /* points to the live data or the snapshot */
 static int g_v2snap = -1;
 
-/* TVMD as of VBlank-IN, before the game's VBlank routine. With VINFREI the renderer runs after
-   ScuSendVBlankIN; if the game briefly clears DISP there, reading TVMD live would blank the frame.
-   Upstream renders before the interrupt. */
+/* TVMD as of VBlank-IN, before the game's VBlank routine. With the decoupled VBlank-IN the renderer
+   runs after ScuSendVBlankIN; if the game briefly clears DISP there, reading TVMD live would blank the
+   frame. Upstream renders before the interrupt. */
 static volatile u16 g_tvmd_vin = 0x8000;
-static volatile int g_tvmd_vin_gueltig = 0;
-extern "C" u16 Vdp2TvmdFuerRender(void) {
-  static int an = -1;
-  if (an < 0) {
-    an = 1;   /* fixed on */
-  }
-  u16 live = Vdp2Regs->TVMD;
-  if (!g_tvmd_vin_gueltig) return live;
-  if (!(live & 0x8000) && (g_tvmd_vin & 0x8000)) {
-  }
-  return an ? g_tvmd_vin : live;
+static volatile int g_tvmd_vin_valid = 0;
+extern "C" u16 Vdp2TvmdForRender(void) {
+  return g_tvmd_vin_valid ? g_tvmd_vin : Vdp2Regs->TVMD;
 }
 
 extern "C" void Vdp2LinesSnapshot(void) {
@@ -147,15 +148,11 @@ static s64 diffticks = 0;
 static u32 framecount = 0;
 static s64 onesecondticks = 0;
 
-int g_taktfix    = 1;
 static int enableFrameLimit = 1;
 static int frameLimitShift = 0;
 
 //#define LOG yprintf
 #define PROFILE_RENDERING 0
-
-/* per-layer mask, defined in vidogl.c (C linkage) */
-extern "C" unsigned char g_nbgweg[5];
 
 
 YabEventQueue * command_ = NULL;
@@ -174,154 +171,59 @@ static int vdp1_manualerase_armed = 0;  // emulation thread: armed until the nex
    point, remembers a token and continues; the token is collected at the start of the next frame
    (pipeline depth one frame, one frame more input latency). The token must never be lost or pending
    twice, hence the drains in Vdp2Reset and Vdp2DeInit. */
-/* Wall-clock nanoseconds per second the emulation thread spends blocked waiting for the render
-   thread (VIN rendezvous, VDP1 join barrier, draw-end wait). */
-unsigned long long g_emublk_ns = 0;
-/* Per-site breakdown of g_emublk_ns. */
-unsigned long long g_eb_vin_ns  = 0;   /* Vdp2JoinPendingVIN  (VIN rendezvous) */
-unsigned long long g_eb_join_ns = 0;   /* Vdp1JoinPendingRenders (full barrier) */
-/* Per-call-site breakdown of the VDP1 join time (VBlank-IN correctness join, VOUT dispatch, PTMR
-   direct draw). g_eb_join_ns remains the sum. */
-unsigned long long g_eb_jvin_ns  = 0;   /* VBlank-IN correctness join */
-unsigned long long g_eb_jvout_ns = 0;   /* VOUT dispatch */
-unsigned long long g_eb_jptmr_ns = 0;   /* PTMR direct draw via the C wrapper */
-unsigned long long g_eb_draw_ns = 0;   /* draw-end wait */
 /* Arm the VBE erase instead of executing it immediately. The erase belongs to the swap of the
    next field; executing it one field early hits the buffer that is still displayed (layer loss).
    Like manualerase, the erase is carried by a persistent flag into the swap field. */
-static int VbeArmOn(void) {
-  static int an = -1;
-  if (an < 0) an = 1;   /* fixed on */
-  return an;
-}
 int g_vbe_armed = 0;              /* persists until the next swap field */
 
-/* Time spent in the frame rate throttle (frameSkipAndLimit: sleep and wait loop). It runs on the
-   render thread inside the window that Vdp2JoinPendingVIN waits for, so with a 60 fps cap the VIN
-   wait is large by design; only (VIN wait - throttle) is real render time. */
-unsigned long long g_eb_sleep_ns = 0;
-/* Time spent in the PTMR direct draw (PTMR==1, vdp1.cpp) in microseconds, and entries per second.
-   Overlaps with g_eb_join_ns and g_emublk_ns; it is not an additional item. */
-unsigned long long g_eb_ptmr_ns = 0;
-unsigned int       g_eb_ptmr_n  = 0;   /* entries per second */
+/* Idle-loop skips of the master SH-2 (DynarecSh2.cpp), read once per second. */
+extern unsigned int g_ls46_m;
 
-/* Idle-loop counters: ls46 counts real idle skips; c2v/npv discarded table entries (instrumentation). */
-extern unsigned int g_ls46_m, g_ls46_s, g_c2_verworfen, g_np_verworfen;
-/* Sound ring underruns per second (und) and missing bytes per second (undb). */
-extern unsigned int g_snd_unter, g_snd_unter_bytes;
-/* deh: control steps per second with more than 2 % stretch; ruf: control steps per second;
-   rat: current ratio x1000. */
-extern unsigned int g_snd_dehn, g_snd_rufe, g_snd_rat_mil;
-/* Number of cycles rejected by the wandering-cycle check (SchleifeWandert() == true means the loop
-   is not skipped as idle). Free-running; per-second differences via zaehl_diff. The extern "C"
-   specification must match the definition. */
-extern "C" unsigned long long g_wanderfix_abgelehnt;
-
-/* Defined in DynarecSh2.cpp (C++), read here without extern "C". Cumulative over the run, not a
-   per-second difference. */
-
-
-/* Per-second difference of a free-running counter; a reset (jetzt < *vorher) clears the stored
+/* Per-second difference of a free-running counter; a reset (now_val < *prev_val) clears the stored
    value. */
-static inline unsigned int zaehl_diff(unsigned int jetzt, unsigned int *vorher) {
+static inline unsigned int counter_delta(unsigned int now_val, unsigned int *prev_val) {
   unsigned int d;
-  if (jetzt < *vorher) { d = jetzt; *vorher = 0; }  /* counter was reset */
-  else                 { d = jetzt - *vorher; *vorher = jetzt; }
+  if (now_val < *prev_val) { d = now_val; *prev_val = 0; }  /* counter was reset */
+  else                 { d = now_val - *prev_val; *prev_val = now_val; }
   return d;
 }
-#ifdef YABA_INSTRUMENT
-static inline void emublk_start(struct timespec *t0) {
-  clock_gettime(CLOCK_MONOTONIC, t0);
-}
-/* ziel2 is optional and receives the same difference, so a block can be booked into a sum and a
-   per-call-site account with one measurement. */
-static inline void emublk_ende_an(const struct timespec *t0,
-                                 unsigned long long *ziel,
-                                 unsigned long long *ziel2 = nullptr) {
-  struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
-  unsigned long long d = (unsigned long long)(t1.tv_sec - t0->tv_sec) * 1000000000ULL
-                       + (unsigned long long)(t1.tv_nsec - t0->tv_nsec);
-  g_emublk_ns += d;
-  *ziel += d;
-  if (ziel2) *ziel2 += d;
-}
-/* Adds to the target only, not to g_emublk_ns: the throttle runs on the render thread and is no
-   emulation thread block. */
-static inline void nurziel_ende(const struct timespec *t0,
-                                unsigned long long *ziel) {
-  struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
-  *ziel += (unsigned long long)(t1.tv_sec - t0->tv_sec) * 1000000000ULL
-         + (unsigned long long)(t1.tv_nsec - t0->tv_nsec);
-}
-#else
-/* Without instrumentation the wall-clock timers compile to nothing. */
-static inline void emublk_start(struct timespec *) { }
-static inline void emublk_ende_an(const struct timespec *, unsigned long long *,
-                                  unsigned long long * = nullptr) { }
-static inline void nurziel_ende(const struct timespec *, unsigned long long *) { }
-#endif
 
-static int g_vinfrei = -1;
+static int g_vin_decoupled = -1;
 static int vin_render_pending = 0;
 
 static void Vdp2JoinPendingVIN(void) {
   if (vin_render_pending) {
-    struct timespec _t0; emublk_start(&_t0);
     YabWaitEventQueue(rcv_evqueue);
-    emublk_ende_an(&_t0, &g_eb_vin_ns);
     vin_render_pending = 0;
   }
 }
 
-/* Callable from outside. Needed before loading a save state: the whole state is overwritten while
-   the VIN token is still pending, and the next join would wait for an event that never comes. */
 /* Cleanup after loading a save state. yabsys.wait_line_count is not saved or restored, while
    LineCount is, so a stale wait line from the previous run could be armed and the emulation thread
    would wait forever in Vdp2HBlankOUT for a token. Vdp2Reset and Vdp2DeInit reset it already. */
 /* Vdp1External is not part of the save state and is not reset on load. manualchange is only set
    on FBCR writes; loading a state in manual-change mode (FBCR&3==3) with the flag cleared means no
-   swap, no drawing and no draw-end, and the game never writes FBCR again.
-   Bit0: set a consistent state after loading; bit1: drain the render thread before loading (join). */
-static int lsvdp1_stufe(void) {
-   static int s = -1;
-   if (s < 0) s = 1;   /* fixed value */
-   return s;
-}
-extern "C" void Vdp2NachSpielstand(void)
+   swap, no drawing and no draw-end, and the game never writes FBCR again. */
+extern "C" void Vdp2AfterLoadState(void)
 {
    yabsys.wait_line_count = -1;
    if (vdp1_rcv_evqueue != NULL) YabClearEventQueue(vdp1_rcv_evqueue);
    Vdp2External.frame_render_flg = 0;
-   int st = lsvdp1_stufe();
-   if (st & 1) {
-      Vdp1External.status = VDP1_STATUS_IDLE;
-      Vdp1External.swap_frame_buffer = 0;
-      Vdp1External.frame_change_plot = (Vdp1Regs->PTMR == 2);
-      Vdp1External.manualchange = ((Vdp1Regs->FBCR & 3) == 3);
-      Vdp1External.manualerase = 0;
-      vdp1_manualerase_armed = 0; g_vbe_armed = 0;
-      vdp1_evt_ridx = vdp1_evt_widx; pre_swap_frame_buffer = 0;
-      /* current_frame is kept: it is tied to the renderer GL buffer index */
-   }
+   Vdp1External.status = VDP1_STATUS_IDLE;
+   Vdp1External.swap_frame_buffer = 0;
+   Vdp1External.frame_change_plot = (Vdp1Regs->PTMR == 2);
+   Vdp1External.manualchange = ((Vdp1Regs->FBCR & 3) == 3);
+   Vdp1External.manualerase = 0;
+   vdp1_manualerase_armed = 0; g_vbe_armed = 0;
+   vdp1_evt_ridx = vdp1_evt_widx; pre_swap_frame_buffer = 0;
+   /* current_frame is kept: it is tied to the renderer GL buffer index */
 }
 
+/* Needed before loading a save state: the whole state is overwritten while the VIN token is still
+   pending, and the next join would wait for an event that never comes. */
 extern "C" void Vdp2DrainPendingVIN(void) { Vdp2JoinPendingVIN(); }
 
-int g_perline_gewuenscht = 0;
-unsigned int fbcr_schreib = 0;      /* FBCR writes per second */
-/* set when no FBCR write occurred for 10 s */
-int g_bios_stumm = 0;
-unsigned int fbcr_letzt   = 0xFFFF; /* last written value */
-unsigned int drawend_gesendet = 0;  /* ScuSendDrawEnd calls per second */
-/* Counts how often the draw-end wait line was postponed by 10 emulated lines because VDP1 was
-   not finished yet. */
-unsigned int g_drawend_spaet = 0;
-
-unsigned int ptmr_schreib = 0;      /* PTMR writes per second */
-unsigned int ptmr_letzt   = 0xFFFF; /* last written plot trigger mode */
-unsigned int vout_dispatch = 0;     /* VOUT dispatches per second */
-unsigned int swap_gesetzt  = 0;     /* times swap_frame_buffer was set to 1 */
-/* Set by main.cpp after a save state is loaded: the FPS count restarts and the log gets a marker. */
+int g_perline_requested = 0;
 
 // Render dispatch / retire join (from 1.20.37): keeps the emulation thread from overwriting
 // Vdp1External flags for the next field while the render thread is still drawing the current one
@@ -341,22 +243,12 @@ extern "C" void Vdp1RamSnapshot(void);
    so dropping one when the queue is full is safe. The enqueue is not moved before
    Vdp1MarkRenderRetired(): for VBLANK_OUT it sits in the middle of vdp2VBlankOUT, before
    Vdp2DrawScreens. */
-static bool JOINFREI_enabled() {
-  static int v = -1;
-  if (v < 0) {
-    v = 1;
-  }
-  return v != 0;
-}
+
 
 /* Enqueue into vdp1_rcv_evqueue in one place so that both callers (VDPEV_DIRECT_DRAW and
    vdp2VBlankOUT) share the handling. */
-static void Vdp1RcvMelden(void) {
-  if (JOINFREI_enabled()) {
-    YabAddEventQueueNichtBlockend(vdp1_rcv_evqueue, 0);
-  } else {
-    YabAddEventQueue(vdp1_rcv_evqueue, 0);   /* blocking path, can deadlock when the queue is full */
-  }
+static void Vdp1RcvSignal(void) {
+  YabAddEventQueueNonBlocking(vdp1_rcv_evqueue, 0);
 }
 
 extern "C" void Vdp1MarkRenderDispatched(void) {
@@ -370,14 +262,10 @@ static void Vdp1MarkRenderRetired(void) {
   pthread_mutex_unlock(&vdp1_join_mtx);
 }
 
-/* wo selects the account of the call site. */
-static void Vdp1JoinPendingRenders(unsigned long long *wo) {
-  /* Time from here counts as emulation thread block, including the spin. */
-  struct timespec _tj; emublk_start(&_tj);
+static void Vdp1JoinPendingRenders(void) {
   for (int i = 0; i < 2000; i++) {
     if (vdp1_ev_retired.load(std::memory_order_acquire) >=
         vdp1_ev_dispatched.load(std::memory_order_relaxed)) {
-      emublk_ende_an(&_tj, &g_eb_join_ns, wo);
       return;
     }
   }
@@ -387,17 +275,10 @@ static void Vdp1JoinPendingRenders(unsigned long long *wo) {
     pthread_cond_wait(&vdp1_join_cv, &vdp1_join_mtx);
   }
   pthread_mutex_unlock(&vdp1_join_mtx);
-  emublk_ende_an(&_tj, &g_eb_join_ns, wo);
 }
 
 
-extern "C" void Vdp1JoinPendingRendersC(void) { Vdp1JoinPendingRenders(&g_eb_jptmr_ns); }
-/* Wait for pending VDP1 jobs before a load, so the render thread does not write
-   registers/swap/current_frame while the state is overwritten. */
-extern "C" void Vdp1VorLaden(void) {
-   int st = lsvdp1_stufe();
-   if (st & 2) Vdp1JoinPendingRenders(&g_eb_jptmr_ns);
-}
+extern "C" void Vdp1JoinPendingRendersC(void) { Vdp1JoinPendingRenders(); }
 
 //---------------------------------------------------------------------------------------
 
@@ -455,6 +336,7 @@ u32 v2_flush_seq;
 
 void Vdp2TexStampFlush(void) {
   v2_flush_seq = ++v2_wseq;
+  v2snap_all = 1;   /* VRAM replaced wholesale (reset, state load): copy everything at the next dispatch */
 }
 
 static inline void Vdp2MarkVramWrite(u32 addr, u32 size) {
@@ -483,8 +365,36 @@ extern "C" void Vdp2RamBlockWritten(u32 addr, u32 bytes) {
     u32 n = page_end - a; if (n > rest) n = rest;
     if (a < 0x20000) A0_Updated = 1; else if (a < 0x40000) A1_Updated = 1; else if (a < 0x60000) B0_Updated = 1; else B1_Updated = 1;
     Vdp2MarkVramWrite(a, n);
+    v2snap_dirty[a >> 12] = 1;
     rest -= n; a = (a + n) & 0x7FFFF;
   }
+}
+
+/* Copy the changed pages into the render snapshot. Called at the VOUT dispatch right after Vdp1JoinPendingRenders(),
+   so no render reads the snapshot meanwhile. Every copied page gets a new texture cache stamp: otherwise a tile written
+   after the previous dispatch would have been decoded from the old copy and kept as fresh. */
+static void Vdp2RamSnapshot(void) {
+  if (Vdp2RamSnap == NULL || Vdp2Ram == NULL) return;
+  if (v2snap_all) {
+    memcpy(Vdp2RamSnap, Vdp2Ram, 0x80000);
+    memset(v2snap_dirty, 0, sizeof(v2snap_dirty));
+    v2snap_all = 0;
+    for (u32 p = 0; p < V2SNAP_PAGES; p++) Vdp2MarkVramWrite(p << 12, 0x1000);
+  } else {
+    u32 i = 0;
+    for (;;) {
+      if (i >= V2SNAP_PAGES) break;
+      if (!v2snap_dirty[i]) { i++; continue; }
+      u32 a0 = i;
+      for (;;) {
+        if (i >= V2SNAP_PAGES || !v2snap_dirty[i]) break;
+        v2snap_dirty[i] = 0; i++;
+      }
+      memcpy(Vdp2RamSnap + (a0 << 12), Vdp2Ram + (a0 << 12), (size_t)(i - a0) << 12);
+      for (u32 p = a0; p < i; p++) Vdp2MarkVramWrite(p << 12, 0x1000);
+    }
+  }
+  Vdp2RamRender = Vdp2RamSnap;
 }
 
 //#define VRAM_WRITE_CHECK 1
@@ -516,6 +426,7 @@ void FASTCALL Vdp2RamWriteByte(u32 addr, u8 val) {
    }
 
    Vdp2MarkVramWrite(addr, 1);
+   v2snap_dirty[addr >> 12] = 1;
    T1WriteByte(Vdp2Ram, addr, val);
 }
 
@@ -546,6 +457,7 @@ void FASTCALL Vdp2RamWriteWord(u32 addr, u16 val) {
    }
 
    Vdp2MarkVramWrite(addr, 2);
+   v2snap_dirty[addr >> 12] = 1; v2snap_dirty[((addr + 1) & 0x7FFFF) >> 12] = 1;
    T1WriteWord(Vdp2Ram, addr, val);
 }
 
@@ -576,6 +488,7 @@ void FASTCALL Vdp2RamWriteLong(u32 addr, u32 val) {
    }
 
    Vdp2MarkVramWrite(addr, 4);
+   v2snap_dirty[addr >> 12] = 1; v2snap_dirty[((addr + 3) & 0x7FFFF) >> 12] = 1;
    T1WriteLong(Vdp2Ram, addr, val);
 }
 
@@ -684,7 +597,10 @@ int Vdp2Init(void) {
    if ((Vdp2Ram = T1MemoryInit(0x80000)) == NULL)
       return -1;
 
-   Vdp2RamRender = Vdp2Ram;
+   Vdp2RamRender = Vdp2Ram;   /* until the first dispatch */
+   if (Vdp2RamSnap == NULL && (Vdp2RamSnap = T1MemoryInit(0x80000)) == NULL)
+      return -1;
+   v2snap_all = 1;
 
    if ((Vdp2ColorRam = T2MemoryInit(0x1000)) == NULL)
       return -1;
@@ -732,6 +648,10 @@ void Vdp2DeInit(void) {
    Vdp2Regs = NULL;
 
    Vdp2RamRender = NULL;
+
+   if (Vdp2RamSnap)
+      T1MemoryDeInit(Vdp2RamSnap);
+   Vdp2RamSnap = NULL;
 
    if (Vdp2Ram)
       T1MemoryDeInit(Vdp2Ram);
@@ -862,7 +782,7 @@ void Vdp2Reset(void) {
    reached from the SH2 thread via Vdp1FrameBufferReadWord (e.g. SCU DMA). No GL context is current
    there, so the call would fail and abort(). */
 static std::atomic<unsigned long> g_render_tid{0};
-extern "C" int YabIstRenderfaden(void)
+extern "C" int YabIsRenderThread(void)
 {
   unsigned long r = g_render_tid.load(std::memory_order_relaxed);
   return (r != 0 && r == (unsigned long)pthread_self()) ? 1 : 0;
@@ -880,11 +800,11 @@ extern "C" void * VdpProc( void *arg ){
   }
 
   /* Bind the thread only once in modes >= 1 (mode 0 rebinds on every VDP event). */
-  int v2_gebunden = 0;
+  int v2_bound = 0;
   while( vdp_proc_running ){
     /* Mode 3 binds no thread at all and leaves placement to the scheduler. */
-    if (YabaKernModus() != 3 && (YabaKernModus() == 0 || !v2_gebunden)) {
-      v2_gebunden = 1;
+    if (!v2_bound) {
+      v2_bound = 1;
 #if defined(__RP64__) || defined(__N2__)	  
       YabThreadSetCurrentThreadAffinityMask(0x5);
 #else
@@ -912,7 +832,7 @@ extern "C" void * VdpProc( void *arg ){
       VIDCore->Vdp1DrawEnd();
       Vdp1External.frame_change_plot = 0;
       FrameProfileAdd("DirectDraw end");
-      Vdp1RcvMelden();
+      Vdp1RcvSignal();
       Vdp1MarkRenderRetired();
       break;
     case VDPEV_MAKECURRENT:
@@ -1132,7 +1052,6 @@ void frameSkipAndLimit() {
     if (framecount == fps) {
       targetTime = (s64)yabsys.tickfreq; // 1sec
     }
-    if (!g_taktfix) targetTime = (s64)(u64)targetTime;
 
     diffticks = curticks - lastticks;
 
@@ -1149,11 +1068,9 @@ void frameSkipAndLimit() {
 
     // just wait for next vsync
     targetTime -= 1000;
-    if ( g_taktfix ? ((s64)(onesecondticks + diffticks) < targetTime)
-                   : ((u64)(onesecondticks + diffticks) < (u64)targetTime) )
+    if ((s64)(onesecondticks + diffticks) < targetTime)
     {
 
-      struct timespec _ts0; emublk_start(&_ts0);
       s64 sleeptime = (targetTime - (onesecondticks + diffticks));
       u64 xcurticks = YabauseGetTicks();
       if (sleeptime-1000 > 0) {
@@ -1167,7 +1084,6 @@ void frameSkipAndLimit() {
         if ((onesecondticks + diffticks) >= targetTime)
           break;
       }
-      nurziel_ende(&_ts0, &g_eb_sleep_ns);
       //u64 realstime = YabauseGetTicks() - xcurticks;
       //yprintf("req time %d,real time %d diff = %d", (u32)sleeptime, (u32)realstime, realstime-sleeptime);
     }
@@ -1194,7 +1110,7 @@ void vdp2VBlankIN(void) {
    VIDCore->Sync();
    /* In decoupled mode the emulation thread sets both itself (Vdp2VBlankIN); doing it here would
       fire a second time. */
-   if (!g_vinfrei) {
+   if (!g_vin_decoupled) {
       Vdp2Regs->TVSTAT |= 0x0008;
    
       ScuSendVBlankIN();
@@ -1221,9 +1137,9 @@ void Vdp2VBlankIN(void) {
     YabThreadStart(YAB_THREAD_VDP, VdpProc, NULL);
   }
 
-  if (g_vinfrei < 0) g_vinfrei = 1;   /* fixed on */
+  if (g_vin_decoupled < 0) g_vin_decoupled = 1;   /* fixed on */
 
-  if (g_vinfrei) {
+  if (g_vin_decoupled) {
     /* Collect the token of the previous frame, then set status and interrupt here and continue
        without waiting for the render thread. */
     Vdp2JoinPendingVIN();
@@ -1234,15 +1150,15 @@ void Vdp2VBlankIN(void) {
        with Vdp1MarkRenderRetired() after Vdp2DrawScreens and does not include Vdp2DrawEnd,
        frameSkipAndLimit or Sync. This join is the only protection of the line scroll tables against
        the reading render thread; do not remove it. */
-    Vdp1JoinPendingRenders(&g_eb_jvin_ns);   /* correctness join */
+    Vdp1JoinPendingRenders();   /* correctness join */
     g_tvmd_vin = Vdp2Regs->TVMD;   /* state before the game's VBlank routine */
-    g_tvmd_vin_gueltig = 1;
+    g_tvmd_vin_valid = 1;
     Vdp2Regs->TVSTAT |= 0x0008;
     ScuSendVBlankIN();
     FrameProfileAdd("VIN event");
     YabAddEventQueue(evqueue,VDPEV_VBLANK_IN);
     vin_render_pending = 1;
-    FrameProfileAdd("VIN entkoppelt");
+    FrameProfileAdd("VIN decoupled");
     return;
   }
 
@@ -1385,18 +1301,38 @@ void Vdp2HBlankOUT(void) {
   // Dispatch only from line 5 on, after the game's VBlank-OUT handler has written its VDP1 registers
   // (FBCR/VBE); otherwise the erase/swap latch would capture the values of the previous field
   // (sprite flicker).
-  if (Vdp2External.frame_render_flg == 0 && vdp1_clock>0 && yabsys.LineCount >= 5 ){ // Delay if vdp1 ram was written
+  /* If a game writes VDP1 RAM during the whole field, vdp1_clock never becomes positive and no VOUT
+     request would ever be sent (output freezes, e.g. Phantasy Star Collection menu). Real hardware has
+     no such gate, so force the request on the last visible line. */
+  const int force_vout = Vdp2External.frame_render_flg == 0 && vdp1_clock <= 0
+                         && yabsys.LineCount >= 5 && yabsys.LineCount == yabsys.VBlankLineCount - 1;
+  /* Direct-draw ordering: a game that starts VDP1 drawing with PTMR=1 every frame normally does so right before the VOUT
+     dispatch. If its command list has a quiet line earlier, the dispatch went out BEFORE the PTMR=1, the render thread then
+     ran VOUT before DIRECT_DRAW and the sprites landed in the wrong frame buffer for one frame (Earthworm Jim 2: HUD
+     flicker in ~3 % of the frames, PTMR=1 at line 12-40). If the game wrote PTMR=1 in each of the last 8 frames and not yet
+     in this one, hold the dispatch until it does, at most until line 80. If that limit is ever reached the game is not
+     regular enough (Sonic Jam alternates), so the hold pauses for 300 frames. */
+  static int ptmr_streak = 0, ptmr_pause = 0, ptmr_expect = 0;
+  if (yabsys.LineCount == 1) {
+    ptmr_streak = g_ptmr_this_frame ? (ptmr_streak < 1000 ? ptmr_streak + 1 : ptmr_streak) : 0;
+    if (ptmr_pause > 0) ptmr_pause--;
+    ptmr_expect = ptmr_streak >= 8 && ptmr_pause == 0;
+    g_ptmr_this_frame = 0;
+  }
+  const int ptmr_hold = ptmr_expect && Vdp2External.frame_render_flg == 0 && !g_ptmr_this_frame && !force_vout
+                        && (int)yabsys.LineCount < 80;
+  if (ptmr_expect && Vdp2External.frame_render_flg == 0 && !g_ptmr_this_frame && (int)yabsys.LineCount == 80)
+    ptmr_pause = 300;
+  if (Vdp2External.frame_render_flg == 0 && (vdp1_clock>0 || force_vout) && yabsys.LineCount >= 5 && !ptmr_hold ){ // Delay if vdp1 ram was written
     FrameProfileAdd("VOUT event");
-    INSTR(vout_dispatch++);
     Vdp2External.frame_render_flg = 1;
 #if defined(YAB_ASYNC_RENDERING)
     /* This join guards the single VDP1 snapshot buffer. */
-    Vdp1JoinPendingRenders(&g_eb_jvout_ns);
+    Vdp1JoinPendingRenders();
 #endif
     // Manual Change
     if (Vdp1External.manualchange == 1) {
       Vdp1External.swap_frame_buffer = 1;
-      INSTR(swap_gesetzt++);
       Vdp1External.manualchange = 0;
     }
 
@@ -1404,7 +1340,6 @@ void Vdp2HBlankOUT(void) {
     if ((Vdp1Regs->FBCR & 0x03) == 0x00 ||
       (Vdp1Regs->FBCR & 0x03) == 0x01) {  // 0x01 is treated as one cyscle mode in Sonic R.
       Vdp1External.swap_frame_buffer = 1;
-      INSTR(swap_gesetzt++);
     }
 
     // Plot trigger mode = Draw when frame is changed
@@ -1427,11 +1362,11 @@ void Vdp2HBlankOUT(void) {
       /* If the erase comes from VBE and no swap falls into this field, arm it and let it travel with the
          swap field, like manualerase below; otherwise it would hit the buffer that is still displayed. The
          FBCR branch ((FBCR&2)==0, one-cycle) is untouched: erase and swap belong together there. */
-      if (VbeArmOn() && vdp1_evt_erase[k_] && !swap_
+      if (vdp1_evt_erase[k_] && !swap_
           && Vdp1External.vbalnk_erase && ((Vdp1Regs->FBCR & 2) != 0)) {
         g_vbe_armed = 1;
         vdp1_evt_erase[k_] = 0;          /* do not erase in this field */
-      } else if (VbeArmOn() && g_vbe_armed && swap_) {
+      } else if (g_vbe_armed && swap_) {
         vdp1_evt_erase[k_] = 1;          /* erase now */
         g_vbe_armed = 0;
       }
@@ -1473,6 +1408,7 @@ void Vdp2HBlankOUT(void) {
        Vdp1Ram. Only changed 4 KB pages are copied. */
     Vdp1RamSnapshot();
     Vdp2LinesSnapshot();
+    Vdp2RamSnapshot();
     FRAMELOG("YabAddEventQueue(evqueue, VDPEV_VBLANK_OUT)");
     YabAddEventQueue(evqueue, VDPEV_VBLANK_OUT);
     Vdp1MarkRenderDispatched();
@@ -1484,21 +1420,17 @@ void Vdp2HBlankOUT(void) {
   if (yabsys.wait_line_count != -1 && yabsys.LineCount == yabsys.wait_line_count) {
       if (Vdp1External.status == VDP1_STATUS_IDLE) {
         FRAMELOG("**WAIT START %d %d**", yabsys.wait_line_count, YaGetQueueSize(vdp1_rcv_evqueue));
-        { struct timespec _t0; emublk_start(&_t0);
-          YabWaitEventQueue(vdp1_rcv_evqueue); // sync VOUT
-          emublk_ende_an(&_t0, &g_eb_draw_ns); }
+        YabWaitEventQueue(vdp1_rcv_evqueue); // sync VOUT
         YabClearEventQueue(vdp1_rcv_evqueue);
         FRAMELOG("**WAIT END**");
         FrameProfileAdd("DirectDraw sync");        
         ScuSendDrawEnd();
-        INSTR(drawend_gesendet++);
         FRAMELOG("Vdp1Draw end at %d line EDSR=%02X", yabsys.LineCount, Vdp1Regs->EDSR);
         yabsys.wait_line_count = -1;
         Vdp1Regs->EDSR |= 2;
       } else {
         yabsys.wait_line_count += 10;
         yabsys.wait_line_count %= yabsys.VBlankLineCount;
-        INSTR(g_drawend_spaet++);
         FRAMELOG("Vdp1Draw wait at %d line EDSR=%02X", yabsys.LineCount, Vdp1Regs->EDSR);
       }
   }
@@ -1511,7 +1443,6 @@ void Vdp2HBlankOUT(void) {
     //printf("COPR = %d at %d\n", Vdp1Regs->COPR, __LINE__);
     if ( Vdp1External.status == VDP1_STATUS_IDLE) {
       ScuSendDrawEnd();
-      INSTR(drawend_gesendet++);
       FRAMELOG("Vdp1Draw end at %d line EDSR=%02X", yabsys.LineCount, Vdp1Regs->EDSR);
       yabsys.wait_line_count = -1;
       Vdp1Regs->EDSR |= 2;
@@ -1519,7 +1450,6 @@ void Vdp2HBlankOUT(void) {
     else {
       yabsys.wait_line_count += 10;
       yabsys.wait_line_count %= yabsys.VBlankLineCount;
-      INSTR(g_drawend_spaet++);
     }
     //VIDCore->Vdp1DrawEnd();
   }
@@ -1605,23 +1535,13 @@ extern int g_emulated_bios;
 
 static void FPSDisplay(void)
 {
-  /* The previous-value statics of these counters live here, so the reset further below can clear them
-     together with the counters: zaehl_diff detects an external reset only by jetzt < *vorher, which
-     fails for a constant rate. */
-#ifdef YABA_INSTRUMENT
-  static unsigned int ptmr_vor = 0, fbcr_vor = 0, dend_vor = 0;
-  static unsigned int swap_vor = 0, vout_vor = 0;
-#endif
   static int fpsframecount = 0;
   static u64 fpsticks;
   //yprintf("%02d/%02d FPS skip=%d vdp1=%02d", fps, yabsys.IsPal ? 50 : 60, show_skipped_frame, show_vdp1_frame);
 #if 1 // FPS only
    /* Do not show the message for every unimplemented BIOS vector; bios.c sets g_bios_game_needs_bios
       only when the same vector is hit repeatedly in a loop signature, and it then stays set. */
-   /* If the game never writes FBCR within 10 seconds it does not use VDP1 at all (g_bios_stumm). */
-   {
-   }
-   if (g_emulated_bios && (g_bios_game_needs_bios || g_bios_stumm))
+   if (g_emulated_bios && g_bios_game_needs_bios)
    {
       OSDPushMessage(OSDMSG_FPS, 1, "%02d/%02d FPS skip=%d vdp1=%02d  >>> BIOS NEEDED <<<", fps, yabsys.IsPal ? 50 : 60, show_skipped_frame, show_vdp1_frame);
    }
@@ -1672,7 +1592,7 @@ static void FPSDisplay(void)
     cpu_f[4] / 1000, cpu_f[5] / 1000, cpu_f[6] / 1000, cpu_f[7] / 1000);
 #endif   
   //OSDPushMessage(OSDMSG_DEBUG, 1, "%d %d %s %s", framecounter, lagframecounter, MovieStatus, InputDisplayString);
-  /* Seconds window based on CLOCK_MONOTONIC; the FPS line goes to stderr for remote measurements. */
+  /* One-second window based on CLOCK_MONOTONIC. */
   fpsframecount++;
   {
     static struct timespec fps_t0;
@@ -1683,90 +1603,53 @@ static void FPSDisplay(void)
                   + (fps_now.tv_nsec - fps_t0.tv_nsec);
     if (dns >= 1000000000LL) {
       fps = (int)((long long)fpsframecount * 1000000000LL / dns);
-      /* The counter is part of the FPS line: it counts how often a wake-up signal was dropped because the
-         queue was full. Appended as a further field; evaluation scripts read $2, $3 and $4. */
       /* Latch the values before printing, so that fps, skip and vdp1 belong to the same second. */
       show_vdp1_frame = vdp1_frame;       vdp1_frame = 0;
       show_skipped_frame = skipped_frame; skipped_frame = 0;
       {
-        /* Always needed: idle skips (l46_m) and emulated fields (d_feld) of the last second drive the
-           ZSERST adaptation below. The first difference is discarded (the counters run during BIOS and
+        /* Always needed: idle skips (idle_skips) and emulated fields (d_fields) of the last second drive the
+           FIRSTSLICE adaptation below. The first difference is discarded (the counters run during BIOS and
            loading). */
         extern int g_frame_count;
-        static unsigned int l46m_vor = 0, feld_vor = 0;
-        static int erstdiff = 1;
-        unsigned int l46_m = zaehl_diff(g_ls46_m, &l46m_vor);
-        unsigned int d_feld = zaehl_diff((unsigned int)g_frame_count, &feld_vor);
-        if (erstdiff) { erstdiff = 0; l46_m = 0; d_feld = 0; }
-        /* With ZSERST=2 this per-second step decides. Step k = 0..11: at k==0 ZSERST is off; at k==1 the
-           second just completed ran without ZSERST, and saturation = l46m/(526 x feld) (526 = 2 time slices
-           per line x 263 lines). It is enabled only if saturation < 20 % and feld < 55. */
+        static unsigned int idle_prev = 0, field_prev = 0;
+        static int first_delta = 1;
+        unsigned int idle_skips = counter_delta(g_ls46_m, &idle_prev);
+        unsigned int d_fields = counter_delta((unsigned int)g_frame_count, &field_prev);
+        if (first_delta) { first_delta = 0; idle_skips = 0; d_fields = 0; }
+        /* Adaptive first-slice rule (DynarecSh2.cpp). Step k = 0..11: at k==0 the rule is off; at k==1 the second
+           just completed ran without it, and saturation = idle skips/(526 x fields) (526 = 2 time slices per line x
+           263 lines). It is enabled only if saturation < 20 % and fields < 55. */
         {
-          extern int ZserstModus();
-          extern volatile int g_zserst_adapt_an;
-          if (ZserstModus() == 2) {
-            static int k = 0;
-            if (k == 0) g_zserst_adapt_an = 0;
-            else if (k == 1) {
-              const double satt = d_feld ? (double)l46_m / (526.0 * (double)d_feld) : 1.0;
-              const int an = (d_feld > 0 && satt < 0.20 && d_feld < 55) ? 1 : 0;
-              g_zserst_adapt_an = an;
-            }
-            k = (k + 1) % 12;
+          extern volatile int g_firstslice_adapt_on;
+          static int k = 0;
+          if (k == 0) g_firstslice_adapt_on = 0;
+          else if (k == 1) {
+            const double saturation = d_fields ? (double)idle_skips / (526.0 * (double)d_fields) : 1.0;
+            g_firstslice_adapt_on = (d_fields > 0 && saturation < 0.20 && d_fields < 55) ? 1 : 0;
           }
+          k = (k + 1) % 12;
         }
-#ifdef YABA_INSTRUMENT
-        /* One line per second with the development counters (rates per second, times in ms/s). */
-        {
-          extern unsigned int g_v1_gezeichnet, g_drawend_spaet;
-          extern unsigned long long g_eb_vin_ns, g_eb_join_ns, g_eb_draw_ns, g_eb_sleep_ns, g_eb_ptmr_ns;
-          extern unsigned int g_rbg_kopien, g_rbg_mapspaet;
-          extern unsigned long long g_rbg_copy_ns, g_rbg_map_ns;
-          extern unsigned int ptmr_schreib, fbcr_schreib, drawend_gesendet, swap_gesetzt, vout_dispatch;
-          static unsigned int wfab_vor = 0, lss_vor = 0, und_vor = 0, deh_vor = 0, ruf_vor = 0;
-          fprintf(stderr, "INSTR: fps=%d vdp1=%d skip=%d feld=%u gez=%u l46m=%u l46s=%u emublk=%llu ebv=%llu ebj=%llu ebd=%llu "
-                  "ebs=%llu ebp=%llu ptmr=%u fbcr=%u dend=%u spaet=%u swap=%u vout=%u wfab=%u und=%u deh=%u ruf=%u rat=%u "
-                  "rbgn=%u rbgc=%llu rbgm=%llu rbgsp=%u c2v=%u npv=%u\n",
-                  fps, show_vdp1_frame, show_skipped_frame, d_feld, g_v1_gezeichnet, l46_m,
-                  zaehl_diff(g_ls46_s, &lss_vor), g_emublk_ns / 1000000ULL, g_eb_vin_ns / 1000000ULL,
-                  g_eb_join_ns / 1000000ULL, g_eb_draw_ns / 1000000ULL, g_eb_sleep_ns / 1000000ULL,
-                  g_eb_ptmr_ns / 1000000ULL, zaehl_diff(ptmr_schreib, &ptmr_vor), zaehl_diff(fbcr_schreib, &fbcr_vor),
-                  zaehl_diff(drawend_gesendet, &dend_vor), g_drawend_spaet, zaehl_diff(swap_gesetzt, &swap_vor),
-                  zaehl_diff(vout_dispatch, &vout_vor), zaehl_diff((unsigned int)g_wanderfix_abgelehnt, &wfab_vor),
-                  zaehl_diff(g_snd_unter, &und_vor), zaehl_diff(g_snd_dehn, &deh_vor), zaehl_diff(g_snd_rufe, &ruf_vor),
-                  g_snd_rat_mil, g_rbg_kopien, g_rbg_copy_ns / 1000000ULL, g_rbg_map_ns / 1000000ULL, g_rbg_mapspaet,
-                  g_c2_verworfen, g_np_verworfen);
-          g_nbgweg[0] = g_nbgweg[1] = g_nbgweg[2] = g_nbgweg[3] = g_nbgweg[4] = 0;
-          g_drawend_spaet = 0;
-          g_emublk_ns = 0;
-          g_eb_vin_ns = 0; g_eb_join_ns = 0; g_eb_draw_ns = 0;
-          g_eb_jvin_ns = 0; g_eb_jvout_ns = 0; g_eb_jptmr_ns = 0;
-          g_eb_sleep_ns = 0; g_eb_ptmr_ns = 0; g_eb_ptmr_n = 0;
-          g_rbg_kopien = 0; g_rbg_copy_ns = 0; g_rbg_map_ns = 0; g_rbg_mapspaet = 0;
-          fflush(stderr);
-        }
-#endif
       }
 
       /* Enable PERLINE only once the game has demonstrably booted instead of at start: enabling it during
          the boot phase can do damage that is not reversible. */
       {
-        extern unsigned int g_v1_gezeichnet;
-        extern int g_perline_gewuenscht;
-        static int bereit_sekunden = 0;
+        extern unsigned int g_v1_drawn;
+        extern int g_perline_requested;
+        static int ready_seconds = 0;
         /* Enable PERLINE once draw commands have been flowing for 3 seconds. The slave state is not used as
            a condition, as some titles never start the slave CPU. */
-        if (g_perline_gewuenscht && yabsys.DecilineMode) {
-          if (g_v1_gezeichnet > 0) {
-            bereit_sekunden++;
-            if (bereit_sekunden >= 3) {
+        if (g_perline_requested && yabsys.DecilineMode) {
+          if (g_v1_drawn > 0) {
+            ready_seconds++;
+            if (ready_seconds >= 3) {
               YabauseSetDecilineMode(0);
             }
           } else {
-            bereit_sekunden = 0;
+            ready_seconds = 0;
           }
         }
-        g_v1_gezeichnet = 0;
+        g_v1_drawn = 0;
 
       }
       fpsframecount = 0;
@@ -1868,12 +1751,12 @@ void vdp2VBlankOUT(void) {
      one is not executed, so two frames in a row are shown and the phase rotates. */
   if (skipnextframe && (!saved)) {
     static int ps_n = -1;
-    static int ps_folge = 0;
+    static int ps_sequence = 0;
     if (ps_n < 0) {
       ps_n = 4;   /* fixed value */
     }
-    if (ps_n > 0 && ++ps_folge > ps_n) {
-      ps_folge = 0;
+    if (ps_n > 0 && ++ps_sequence > ps_n) {
+      ps_sequence = 0;
       skipnextframe = 0;
     }
   }
@@ -1995,7 +1878,7 @@ void vdp2VBlankOUT(void) {
 
 #if defined(YAB_ASYNC_RENDERING)
   if (isrender){
-    Vdp1RcvMelden();
+    Vdp1RcvSignal();
   }
 #else
   //yabsys.wait_line_count = 45;

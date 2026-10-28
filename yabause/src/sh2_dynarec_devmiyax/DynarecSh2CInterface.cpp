@@ -412,10 +412,6 @@ void SH2DynWriteNotify(u32 start, u32 length){
 #pragma GCC optimize ("O1")
 #endif
 
-/* Writes that store the value already present in work RAM do not invalidate
-   translated code. The stage is fixed at 2 (compare, and skip setDirty when
-   equal). */
-static inline int WertGleichStufe(void) { return 2; }
 
 void memSetByte(u32 addr , u8 data )
 {
@@ -437,12 +433,7 @@ void memSetByte(u32 addr , u8 data )
   case 0x06000000:
 #if defined(SET_DIRTY)
     {
-      const int wg = WertGleichStufe();
-      int gleich = 0;
-      if (wg > 0) {
-        gleich = (T2ReadByte(HighWram, addr & 0xFFFFF) == data);
-      }
-      if (!(gleich && wg >= 2)) block->setDirty(addr);
+      if (T2ReadByte(HighWram, addr & 0xFFFFF) != data) block->setDirty(addr);   /* same value: code stays valid */
     }
 #else
     block->LookupTable[ (addr&0x000FFFFF)>>1 ] = NULL;
@@ -486,12 +477,7 @@ void memSetWord(u32 addr, u16 data )
    case 0x06000000:  {
 #if defined(SET_DIRTY)
      {
-       const int wg = WertGleichStufe();
-       int gleich = 0;
-       if (wg > 0) {
-         gleich = (T2ReadWord(HighWram, addr & 0xFFFFF) == data);
-       }
-       if (!(gleich && wg >= 2)) block->setDirty(addr);
+       if (T2ReadWord(HighWram, addr & 0xFFFFF) != data) block->setDirty(addr);   /* same value: code stays valid */
      }
 #else
      block->LookupTable[(addr & 0x000FFFFF) >> 1] = NULL;
@@ -535,16 +521,9 @@ void memSetLong(u32 addr , u32 data )
   // High Memory
   case 0x06000000:
 #if defined(SET_DIRTY)
-    {
-      const int wg = WertGleichStufe();
-      int gleich = 0;
-      if (wg > 0) {
-        gleich = (T2ReadLong(HighWram, addr & 0xFFFFF) == data);
-      }
-      if (!(gleich && wg >= 2)) {
-        block->setDirty(addr);
-        block->setDirty(addr+2);
-      }
+    if (T2ReadLong(HighWram, addr & 0xFFFFF) != data) {   /* same value: code stays valid */
+      block->setDirty(addr);
+      block->setDirty(addr+2);
     }
 #else
     block->LookupTable[(addr & 0x000FFFFF) >> 1] = NULL;
@@ -571,9 +550,6 @@ void memSetLong(u32 addr , u32 data )
 /* Fast path for the SH2 on-chip registers (0xFFFFFE00-0xFFFFFFFF): reads
    skip the generic MappedMemoryRead dispatch. The memory cycle cost for this
    range is 0 in every configuration, so omitting memcycle is equivalent. */
-static inline bool IoFastAn() { return true; }
-/* Leaf functions may access on-chip registers directly, as the C path does. */
-extern "C" int MemFastIoFastAn(void) { return 1; }
 
 u8 memGetByte(u32 addr)
 {
@@ -598,7 +574,7 @@ u8 memGetByte(u32 addr)
     return val;
     break;
   }
-  if (IoFastAn() && addr >= 0xFFFFFE00u) {
+  if (addr >= 0xFFFFFE00u) {
     dynaFree();
     return OnchipReadByte(addr & 0x1FFu);
   }
@@ -631,7 +607,7 @@ u16 memGetWord(u32 addr)
     return val;
     break;
   }
-  if (IoFastAn() && addr >= 0xFFFFFE00u) {
+  if (addr >= 0xFFFFFE00u) {
     dynaFree();
     return OnchipReadWord(addr & 0x1FFu);
   }
@@ -664,7 +640,7 @@ u32 memGetLong(u32 addr)
     return val;
     break;
   }
-  if (IoFastAn() && addr >= 0xFFFFFE00u) {
+  if (addr >= 0xFFFFFE00u) {
     dynaFree();
     return OnchipReadLong(addr & 0x1FFu);
   }
@@ -821,10 +797,10 @@ int EachClock() {
 
 /* Removes a pending (not yet accepted) interrupt from the dynarec core and
    reports whether it was pending. Caller: scu.c, on IMS writes only. */
-extern "C" int SH2DynRemoveInterruptTreffer(SH2_struct *context, u8 vector) {
+extern "C" int SH2DynRemoveInterruptHit(SH2_struct *context, u8 vector) {
   DynarecSh2 *pctx = (DynarecSh2*)context->ext;
-  const size_t vor = pctx->m_IntruptTbl.size();
+  const size_t prev_cnt = pctx->m_IntruptTbl.size();
   pctx->RemoveInterrupt(vector, 0);
-  return pctx->m_IntruptTbl.size() != vor;
+  return pctx->m_IntruptTbl.size() != prev_cnt;
 }
 

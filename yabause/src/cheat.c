@@ -41,6 +41,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 */
 
 #include <stdlib.h>
+#include <ctype.h>
 #include "cheat.h"
 #include "memory.h"
 #include "sh2core.h"
@@ -88,6 +89,7 @@ int CheatAddCode(int type, u32 addr, u32 val)
    cheatlist[numcheats].val = val;
    cheatlist[numcheats].desc = NULL;
    cheatlist[numcheats].enable = 1;
+   cheatlist[numcheats].group = -1;
    numcheats++;
 
    // Make sure we still have room
@@ -248,6 +250,113 @@ void CheatDisableCode(int index)
 
 //////////////////////////////////////////////////////////////////////////////
 
+void CheatEnableGroup(int group, int enable)
+{
+   int i;
+
+   for (i = 0; i < numcheats; i++)
+      if (cheatlist[i].group == group)
+         cheatlist[i].enable = enable;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+/* Read a libretro/RetroArch .cht file: cheatN_desc / cheatN_code / cheatN_enable per entry.
+   The code is a list of Action Replay pairs joined by '+' ("1607FB08+0100+..."). Every code gets
+   group = N so an entry is switched as a whole. Master codes (F/B) are only needed by the real
+   AR cartridge and are skipped. Returns the number of entries with at least one code. */
+static int ChtHex(const char *s, size_t len)
+{
+   size_t i;
+
+   if (strlen(s) != len)
+      return 0;
+   for (i = 0; i < len; i++)
+      if (!isxdigit((unsigned char)s[i]))
+         return 0;
+   return 1;
+}
+
+static int ChtAddEntry(int n, const char *desc, const char *code, int enable)
+{
+   char chain[8192], adr[9] = "";
+   char *tok, *rest;
+   char ar[16];
+   int codes = 0;
+
+   strncpy(chain, code, sizeof(chain) - 1);
+   chain[sizeof(chain) - 1] = 0;
+   for (tok = strtok_r(chain, "+ \t", &rest); tok; tok = strtok_r(NULL, "+ \t", &rest))
+   {
+      const char *val = tok;
+
+      if (adr[0] == 0)
+      {
+         /* some files write address and value without a separator: "1609207200a0" */
+         if (ChtHex(tok, 12)) { memcpy(adr, tok, 8); adr[8] = 0; val = tok + 8; }
+         else { snprintf(adr, sizeof(adr), "%.8s", tok); if (!ChtHex(adr, 8)) adr[0] = '?'; continue; }
+      }
+      /* "0???" and the like are placeholders to fill in; F/B = master code of the real AR cartridge */
+      if (ChtHex(adr, 8) && ChtHex(val, 4) && strchr("FfBb", adr[0]) == NULL)
+      {
+         snprintf(ar, sizeof(ar), "%s %s", adr, val);
+         if (CheatAddARCode(ar) == 0)
+         {
+            cheatlist[numcheats - 1].desc = strdup(desc);
+            cheatlist[numcheats - 1].enable = enable;
+            cheatlist[numcheats - 1].group = n;
+            codes++;
+         }
+      }
+      adr[0] = 0;
+   }
+   return codes > 0;
+}
+
+int CheatLoadCht(const char *filename)
+{
+   FILE *fp;
+   char line[8192], desc[256] = "", code[8192] = "";
+   int n = -1, k, enable = 0, entries = 0;
+
+   if ((fp = fopen(filename, "r")) == NULL)
+      return -1;
+
+   while (fgets(line, sizeof(line), fp))
+   {
+      char field[16], val[8192], *a, *e;
+
+      if (sscanf(line, " cheat%d_%15[a-z] =", &k, field) != 2)
+         continue;
+      if (k != n)
+      {
+         if (n >= 0 && code[0])
+            entries += ChtAddEntry(n, desc, code, enable);
+         n = k; desc[0] = 0; code[0] = 0; enable = 0;
+      }
+      a = strchr(line, '=');
+      for (a++; *a == ' ' || *a == '\t' || *a == '"'; a++);
+      strncpy(val, a, sizeof(val) - 1);
+      val[sizeof(val) - 1] = 0;
+      for (e = val + strlen(val); e > val && strchr("\"\r\n \t", e[-1]); e--);
+      *e = 0;
+
+      if (strcmp(field, "desc") == 0)
+         snprintf(desc, sizeof(desc), "%s", val);
+      else if (strcmp(field, "code") == 0)
+         snprintf(code, sizeof(code), "%s", val);
+      else if (strcmp(field, "enable") == 0)
+         enable = (strcmp(val, "true") == 0);
+   }
+   if (n >= 0 && code[0])
+      entries += ChtAddEntry(n, desc, code, enable);
+
+   fclose(fp);
+   return entries;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
 void CheatDoPatches(void)
 {
    int i;
@@ -262,8 +371,11 @@ void CheatDoPatches(void)
             if (cheatlist[i].enable == 0)
                continue;
             LOG("CheatDoPatches %08X", cheatlist[i].addr);
-            if (MappedMemoryReadWord(cheatlist[i].addr, NULL) != cheatlist[i].val)
-               return;
+            /* Action Replay Dxxxxxxx: run the NEXT code only if equal. Returning here
+               aborted the rest of the list, including unrelated entries. */
+            if (MappedMemoryReadWord(cheatlist[i].addr, NULL) != cheatlist[i].val &&
+                cheatlist[i+1].type != CHEATTYPE_NONE)
+               i++;
             break;
          case CHEATTYPE_BYTEWRITE:
             if (cheatlist[i].enable == 0)

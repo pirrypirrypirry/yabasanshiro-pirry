@@ -163,18 +163,12 @@ int ShaderDrawTest()
    Vdp1GetSpritePixelInfo leaves of 0xFFFF. The Gouraud effect on the color
    calculation / priority bits is not reproduced. */
 extern Vdp2 * fixVdp2Regs;
-static int GouraudFarbmaske(void) {
-  static int an = -1;
-  if (an < 0) {
-    an = 1;
-  }
-  if (!an || fixVdp2Regs == NULL) return 0xFFFF;
-  {
-    u16 p_ = 0xFFFF;
-    spritepixelinfo_struct spi_;
-    Vdp1GetSpritePixelInfo(fixVdp2Regs->SPCTL & 0xF, &p_, &spi_);
-    return p_;
-  }
+static int GouraudColorMask(void) {
+  u16 p_ = 0xFFFF;
+  spritepixelinfo_struct spi_;
+  if (fixVdp2Regs == NULL) return 0xFFFF;
+  Vdp1GetSpritePixelInfo(fixVdp2Regs->SPCTL & 0xF, &p_, &spi_);
+  return p_;
 }
 
 void Ygl_Vdp1CommonGetUniformId(GLuint pgid, YglVdp1CommonParam * param){
@@ -183,7 +177,7 @@ void Ygl_Vdp1CommonGetUniformId(GLuint pgid, YglVdp1CommonParam * param){
   /* Store location+1 so that 0 means missing/never filled. shadow/shadow_tess do
        not go through this function ({0} init); a directly stored 0 would be taken
        as uniform location 0 there. */
-  param->farbmaske = glGetUniformLocation(pgid, (const GLchar *)"u_farbmaske") + 1;
+  param->color_mask = glGetUniformLocation(pgid, (const GLchar *)"u_colormask") + 1;
   param->sprite = glGetUniformLocation(pgid, (const GLchar *)"u_sprite");
   param->tessLevelInner = glGetUniformLocation(pgid, (const GLchar *)"TessLevelInner");
   param->tessLevelOuter = glGetUniformLocation(pgid, (const GLchar *)"TessLevelOuter");
@@ -220,7 +214,7 @@ int Ygl_uniformVdp1CommonParam(void * p){
   if (param->sprite != -1){
     glUniform1i(param->sprite, 0);
   }
-  if (param->farbmaske > 0) glUniform1i(param->farbmaske - 1, GouraudFarbmaske());
+  if (param->color_mask > 0) glUniform1i(param->color_mask - 1, GouraudColorMask());
 
   if (param->tessLevelInner != -1) {
     glUniform1f(param->tessLevelInner, (float)TESS_COUNT);
@@ -1343,7 +1337,7 @@ const GLchar * pYglprg_vdp1_gouraudshading_v[] = {Yglprg_vdp1_gouraudshading_v, 
 /* The fragment shader body is a macro with two headers: the tessellation
    program needs #version 310 es for all its stages, and all stages of one
    program must use the same language version. */
-#define YGL_VDP1_GOURAUD_F_RUMPF \
+#define YGL_VDP1_GOURAUD_F_BODY \
 "uniform sampler2D u_sprite;                                              \n" \
 "in vec4 v_texcoord;                                                 \n" \
 "in vec4 v_vtxcolor;                                                 \n" \
@@ -1366,7 +1360,7 @@ const GLchar Yglprg_vdp1_gouraudshading_f[] =
 #else
 "#version 330 \n"
 #endif
-YGL_VDP1_GOURAUD_F_RUMPF;
+YGL_VDP1_GOURAUD_F_BODY;
 const GLchar * pYglprg_vdp1_gouraudshading_f[] = {Yglprg_vdp1_gouraudshading_f, NULL};
 
 /* Gouraud shading on index-color sprites, per channel in 5 bit. The texture
@@ -1379,7 +1373,7 @@ const GLchar * pYglprg_vdp1_gouraudshading_f[] = {Yglprg_vdp1_gouraudshading_f, 
    v_vtxcolor = g/31 - 0.5, hence g = v*31 + 15.5. Direct color (flag 0x40
    clear) is computed as before. The variant is chosen once at shader
    initialization. */
-#define YGL_VDP1_GOURAUD_IDX_KERN \
+#define YGL_VDP1_GOURAUD_IDX_CORE \
 "  int gi_fl = int(round(spriteColor.a*255.0));                            \n" \
 "  if( (gi_fl & 0x40) != 0 ){                                              \n" \
 "    int gi_v = int(round(spriteColor.r*255.0)) | (int(round(spriteColor.g*255.0)) << 8); \n" \
@@ -1388,16 +1382,16 @@ const GLchar * pYglprg_vdp1_gouraudshading_f[] = {Yglprg_vdp1_gouraudshading_f, 
 "    int gi_g = clamp(((gi_v >> 5) & 31) + gi_d.g, 0, 31);                 \n" \
 "    int gi_b = clamp(((gi_v >> 10) & 31) + gi_d.b, 0, 31);                \n" \
 "    int gi_n = (gi_v & 0x8000) | (gi_b << 10) | (gi_g << 5) | gi_r;       \n" \
-"    gi_n = (gi_n & u_farbmaske) | (gi_v & ~u_farbmaske);\n" \
+"    gi_n = (gi_n & u_colormask) | (gi_v & ~u_colormask);\n" \
 "    fragColor = vec4(float(gi_n & 0xFF)/255.0, float((gi_n >> 8) & 0xFF)/255.0, spriteColor.b, spriteColor.a); \n" \
 "  }else{                                                                  \n" \
 "    fragColor  = clamp(spriteColor+v_vtxcolor,vec4(0.0),vec4(1.0));      \n" \
 "    fragColor.a = spriteColor.a;                                          \n" \
 "  }                                                                       \n"
 
-#define YGL_VDP1_GOURAUD_IDX_KOPF \
+#define YGL_VDP1_GOURAUD_IDX_HEAD \
 "precision highp int;\n" \
-"uniform int u_farbmaske;\n" \
+"uniform int u_colormask;\n" \
 "uniform sampler2D u_sprite;                                              \n" \
 "in vec4 v_texcoord;                                                 \n" \
 "in vec4 v_vtxcolor;                                                 \n" \
@@ -1415,9 +1409,9 @@ const GLchar Yglprg_vdp1_gouraudshading_idx_f[] =
 #else
 "#version 330 \n"
 #endif
-YGL_VDP1_GOURAUD_IDX_KOPF
+YGL_VDP1_GOURAUD_IDX_HEAD
 "  if( spriteColor.a == 0.0 ) discard;                                      \n"
-YGL_VDP1_GOURAUD_IDX_KERN
+YGL_VDP1_GOURAUD_IDX_CORE
 "}\n";
 const GLchar * pYglprg_vdp1_gouraudshading_idx_f[] = {Yglprg_vdp1_gouraudshading_idx_f, NULL};
 
@@ -1428,9 +1422,9 @@ const GLchar Yglprg_vdp1_gouraudshading_idx_tess_f[] =
 #else
 "#version 330 \n"
 #endif
-YGL_VDP1_GOURAUD_IDX_KOPF
+YGL_VDP1_GOURAUD_IDX_HEAD
 "  if( spriteColor.a == 0.0 ) discard;                                      \n"
-YGL_VDP1_GOURAUD_IDX_KERN
+YGL_VDP1_GOURAUD_IDX_CORE
 "}\n";
 const GLchar * pYglprg_vdp1_gouraudshading_idx_tess_f[] = {Yglprg_vdp1_gouraudshading_idx_tess_f, NULL};
 
@@ -1442,18 +1436,11 @@ const GLchar Yglprg_vdp1_gouraudshading_spd_idx_f[] =
 #else
 "#version 330 \n"
 #endif
-YGL_VDP1_GOURAUD_IDX_KOPF
-YGL_VDP1_GOURAUD_IDX_KERN
+YGL_VDP1_GOURAUD_IDX_HEAD
+YGL_VDP1_GOURAUD_IDX_CORE
 "}\n";
 const GLchar * pYglprg_vdp1_gouraudshading_spd_idx_f[] = {Yglprg_vdp1_gouraudshading_spd_idx_f, NULL};
 
-static int gouraudidx_an(void) {
-  static int v = -1;
-  if (v < 0) {
-    v = 1;
-  }
-  return v;
-}
 
 /* Same body with the 310 header, for the tessellation program only. */
 const GLchar Yglprg_vdp1_gouraudshading_tess_f[] =
@@ -1463,7 +1450,7 @@ const GLchar Yglprg_vdp1_gouraudshading_tess_f[] =
 #else
 "#version 330 \n"
 #endif
-YGL_VDP1_GOURAUD_F_RUMPF;
+YGL_VDP1_GOURAUD_F_BODY;
 const GLchar * pYglprg_vdp1_gouraudshading_tess_f[] = {Yglprg_vdp1_gouraudshading_tess_f, NULL};
 
 const GLchar Yglprg_vdp1_gouraudshading_spd_f[] =
@@ -3542,12 +3529,12 @@ int YglProgramInit()
 
    //-----------------------------------------------------------------------------------------------------------
 
-   if (YglInitShader(PG_VFP1_GOURAUDSAHDING, pYglprg_vdp1_gouraudshading_v, gouraudidx_an() ? pYglprg_vdp1_gouraudshading_idx_f : pYglprg_vdp1_gouraudshading_f, 1,NULL, NULL, NULL) != 0)
+   if (YglInitShader(PG_VFP1_GOURAUDSAHDING, pYglprg_vdp1_gouraudshading_v, pYglprg_vdp1_gouraudshading_idx_f, 1,NULL, NULL, NULL) != 0)
       return -1;
 
    Ygl_Vdp1CommonGetUniformId(_prgid[PG_VFP1_GOURAUDSAHDING], &id_g);
 
-   if (YglInitShader(PG_VFP1_GOURAUDSAHDING_SPD, pYglprg_vdp1_gouraudshading_v, gouraudidx_an() ? pYglprg_vdp1_gouraudshading_spd_idx_f : pYglprg_vdp1_gouraudshading_spd_f, 1, NULL, NULL, NULL) != 0)
+   if (YglInitShader(PG_VFP1_GOURAUDSAHDING_SPD, pYglprg_vdp1_gouraudshading_v, pYglprg_vdp1_gouraudshading_spd_idx_f, 1, NULL, NULL, NULL) != 0)
      return -1;
 
    Ygl_Vdp1CommonGetUniformId(_prgid[PG_VFP1_GOURAUDSAHDING_SPD], &id_spd_g);
@@ -3692,7 +3679,7 @@ int YglTesserationProgramInit()
   //-----------------------------------------------------------------------------------------------------------
     if (YglInitShader(PG_VFP1_GOURAUDSAHDING_TESS,
         pYglprg_vdp1_gouraudshading_tess_v,
-        gouraudidx_an() ? pYglprg_vdp1_gouraudshading_idx_tess_f : pYglprg_vdp1_gouraudshading_tess_f,
+        pYglprg_vdp1_gouraudshading_idx_tess_f,
         1,
         pYglprg_vdp1_gouraudshading_tess_c,
         pYglprg_vdp1_gouraudshading_tess_e,
@@ -3704,7 +3691,7 @@ int YglTesserationProgramInit()
 
     if (YglInitShader(PG_VFP1_GOURAUDSAHDING_SPD_TESS,
       pYglprg_vdp1_gouraudshading_tess_v,
-      gouraudidx_an() ? pYglprg_vdp1_gouraudshading_spd_idx_f : pYglprg_vdp1_gouraudshading_spd_f,
+      pYglprg_vdp1_gouraudshading_spd_idx_f,
       1,
       pYglprg_vdp1_gouraudshading_tess_c,
       pYglprg_vdp1_gouraudshading_tess_e,
@@ -3789,7 +3776,7 @@ void YglInvalidateProgramCache(void)
 }
 
 /* Uniform locations are queried directly from the driver. */
-static GLint YglULocDirekt(GLuint prog, const char *name)
+static GLint YglULocDirect(GLuint prog, const char *name)
 {
   return glGetUniformLocation(prog, (const GLchar *)name);
 }
@@ -4016,8 +4003,8 @@ int YglProgramChange( YglLevel * level, int prgid )
      current->texcoordp = 1;
      level->prg[level->prgcurrent].vaid = 2;
      current->mtxModelView = grow_tess.mtxModelView;
-     current->mtxTexture = -1; // YglULocDirekt(_prgid[PG_VFP1_GOURAUDSAHDING], (const GLchar *)"u_texMatrix");
-     current->tex0 = -1; // YglULocDirekt(_prgid[PG_VFP1_GOURAUDSAHDING], (const GLchar *)"s_texture");
+     current->mtxTexture = -1;
+     current->tex0 = -1;
    }
    else if (prgid == PG_VFP1_GOURAUDSAHDING_SPD_TESS){
      level->prg[level->prgcurrent].setupUniform = Ygl_uniformVdp1CommonParam;
@@ -4027,8 +4014,8 @@ int YglProgramChange( YglLevel * level, int prgid )
      current->texcoordp = 1;
      level->prg[level->prgcurrent].vaid = 2;
      current->mtxModelView = grow_tess.mtxModelView;
-     current->mtxTexture = -1; // YglULocDirekt(_prgid[PG_VFP1_GOURAUDSAHDING], (const GLchar *)"u_texMatrix");
-     current->tex0 = -1; // YglULocDirekt(_prgid[PG_VFP1_GOURAUDSAHDING], (const GLchar *)"s_texture");
+     current->mtxTexture = -1;
+     current->tex0 = -1;
    }
    else if (prgid == PG_VDP1_USER_CLIP)
    {
@@ -4061,7 +4048,7 @@ int YglProgramChange( YglLevel * level, int prgid )
         static GLint s_uloc_startuserclip_mvp = -2;
         current->mtxModelView = YglCachedUniformLoc(&s_uloc_startuserclip_mvp, _prgid[PG_WINDOW], "u_mvpMatrix");
       }
-      current->mtxTexture      = -1; //YglULocDirekt(_prgid[PG_NORMAL],(const GLchar *)"u_texMatrix");
+      current->mtxTexture      = -1; //YglULocDirect(_prgid[PG_NORMAL],(const GLchar *)"u_texMatrix");
       
    }
    else if( prgid == PG_VFP1_ENDUSERCLIP )
@@ -4134,7 +4121,7 @@ int YglProgramChange( YglLevel * level, int prgid )
        static GLint s_uloc_shadow_tess_mvp = -2;
        current->mtxModelView = YglCachedUniformLoc(&s_uloc_shadow_tess_mvp, _prgid[PG_VFP1_SHADOW_TESS], "u_mvpMatrix");
      }
-     current->mtxTexture = -1; // YglULocDirekt(_prgid[PG_VFP1_SHADOW], (const GLchar *)"u_texMatrix");
+     current->mtxTexture = -1;
 
    }
 
@@ -4188,7 +4175,7 @@ int YglProgramChange( YglLevel * level, int prgid )
      current->vertexp = 0;
      current->texcoordp = 1;
      level->prg[level->prgcurrent].vaid = 2;
-     current->mtxModelView = YglULocDirekt(_prgid[PG_VFP1_GOURAUDSAHDING_HALFTRANS], (const GLchar *)"u_mvpMatrix");
+     current->mtxModelView = YglULocDirect(_prgid[PG_VFP1_GOURAUDSAHDING_HALFTRANS], (const GLchar *)"u_mvpMatrix");
      current->mtxTexture = -1;
 
    }
@@ -4200,7 +4187,7 @@ int YglProgramChange( YglLevel * level, int prgid )
      current->vertexp = 0;
      current->texcoordp = 1;
      level->prg[level->prgcurrent].vaid = 2;
-     current->mtxModelView = YglULocDirekt(_prgid[PG_VFP1_GOURAUDSAHDING_HALFTRANS_TESS], (const GLchar *)"u_mvpMatrix");
+     current->mtxModelView = YglULocDirect(_prgid[PG_VFP1_GOURAUDSAHDING_HALFTRANS_TESS], (const GLchar *)"u_mvpMatrix");
      current->mtxTexture = -1;
 
    }else if( prgid == PG_VDP2_ADDBLEND )
@@ -4209,8 +4196,8 @@ int YglProgramChange( YglLevel * level, int prgid )
       level->prg[level->prgcurrent].cleanupUniform = Ygl_cleanupAddBlend;
       current->vertexp = 0;
       current->texcoordp = 1;
-      current->mtxModelView    = YglULocDirekt(_prgid[PG_NORMAL],(const GLchar *)"u_mvpMatrix");
-      current->mtxTexture      = YglULocDirekt(_prgid[PG_NORMAL],(const GLchar *)"u_texMatrix");
+      current->mtxModelView    = YglULocDirect(_prgid[PG_NORMAL],(const GLchar *)"u_mvpMatrix");
+      current->mtxTexture      = YglULocDirect(_prgid[PG_NORMAL],(const GLchar *)"u_texMatrix");
    }
    else if (prgid == PG_LINECOLOR_INSERT)
    {
@@ -4218,10 +4205,10 @@ int YglProgramChange( YglLevel * level, int prgid )
      current->cleanupUniform = Ygl_cleanupLinecolorInsert;
      current->vertexp = 0;
      current->texcoordp = 1;
-     current->mtxModelView = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT], (const GLchar *)"u_mvpMatrix");
-     current->mtxTexture = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT], (const GLchar *)"u_texMatrix");
-     current->color_offset = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT], (const GLchar *)"u_color_offset");
-     current->tex0 = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT], (const GLchar *)"s_texture");
+     current->mtxModelView = YglULocDirect(_prgid[PG_LINECOLOR_INSERT], (const GLchar *)"u_mvpMatrix");
+     current->mtxTexture = YglULocDirect(_prgid[PG_LINECOLOR_INSERT], (const GLchar *)"u_texMatrix");
+     current->color_offset = YglULocDirect(_prgid[PG_LINECOLOR_INSERT], (const GLchar *)"u_color_offset");
+     current->tex0 = YglULocDirect(_prgid[PG_LINECOLOR_INSERT], (const GLchar *)"s_texture");
    }
    else if (prgid == PG_LINECOLOR_INSERT_DESTALPHA)
    {
@@ -4229,10 +4216,10 @@ int YglProgramChange( YglLevel * level, int prgid )
      current->cleanupUniform = Ygl_cleanupLinecolorInsert;
      current->vertexp = 0;
      current->texcoordp = 1;
-     current->mtxModelView = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT_DESTALPHA], (const GLchar *)"u_mvpMatrix");
-     current->mtxTexture = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT_DESTALPHA], (const GLchar *)"u_texMatrix");
-     current->color_offset = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT_DESTALPHA], (const GLchar *)"u_color_offset");
-     current->tex0 = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT_DESTALPHA], (const GLchar *)"s_texture");
+     current->mtxModelView = YglULocDirect(_prgid[PG_LINECOLOR_INSERT_DESTALPHA], (const GLchar *)"u_mvpMatrix");
+     current->mtxTexture = YglULocDirect(_prgid[PG_LINECOLOR_INSERT_DESTALPHA], (const GLchar *)"u_texMatrix");
+     current->color_offset = YglULocDirect(_prgid[PG_LINECOLOR_INSERT_DESTALPHA], (const GLchar *)"u_color_offset");
+     current->tex0 = YglULocDirect(_prgid[PG_LINECOLOR_INSERT_DESTALPHA], (const GLchar *)"s_texture");
    }
    else if (prgid == PG_LINECOLOR_INSERT_CRAM)
    {
@@ -4240,10 +4227,10 @@ int YglProgramChange( YglLevel * level, int prgid )
      current->cleanupUniform = Ygl_cleanupLinecolorInsert;
      current->vertexp = 0;
      current->texcoordp = 1;
-     current->mtxModelView = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT_CRAM], (const GLchar *)"u_mvpMatrix");
-     current->mtxTexture = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT_CRAM], (const GLchar *)"u_texMatrix");
-     current->color_offset = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT_CRAM], (const GLchar *)"u_color_offset");
-     current->tex0 = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT_CRAM], (const GLchar *)"s_texture");
+     current->mtxModelView = YglULocDirect(_prgid[PG_LINECOLOR_INSERT_CRAM], (const GLchar *)"u_mvpMatrix");
+     current->mtxTexture = YglULocDirect(_prgid[PG_LINECOLOR_INSERT_CRAM], (const GLchar *)"u_texMatrix");
+     current->color_offset = YglULocDirect(_prgid[PG_LINECOLOR_INSERT_CRAM], (const GLchar *)"u_color_offset");
+     current->tex0 = YglULocDirect(_prgid[PG_LINECOLOR_INSERT_CRAM], (const GLchar *)"s_texture");
    }
    else if (prgid == PG_LINECOLOR_INSERT_DESTALPHA_CRAM)
    {
@@ -4251,10 +4238,10 @@ int YglProgramChange( YglLevel * level, int prgid )
      current->cleanupUniform = Ygl_cleanupLinecolorInsert;
      current->vertexp = 0;
      current->texcoordp = 1;
-     current->mtxModelView = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT_DESTALPHA_CRAM], (const GLchar *)"u_mvpMatrix");
-     current->mtxTexture = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT_DESTALPHA_CRAM], (const GLchar *)"u_texMatrix");
-     current->color_offset = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT_DESTALPHA_CRAM], (const GLchar *)"u_color_offset");
-     current->tex0 = YglULocDirekt(_prgid[PG_LINECOLOR_INSERT_DESTALPHA_CRAM], (const GLchar *)"s_texture");
+     current->mtxModelView = YglULocDirect(_prgid[PG_LINECOLOR_INSERT_DESTALPHA_CRAM], (const GLchar *)"u_mvpMatrix");
+     current->mtxTexture = YglULocDirect(_prgid[PG_LINECOLOR_INSERT_DESTALPHA_CRAM], (const GLchar *)"u_texMatrix");
+     current->color_offset = YglULocDirect(_prgid[PG_LINECOLOR_INSERT_DESTALPHA_CRAM], (const GLchar *)"u_color_offset");
+     current->tex0 = YglULocDirect(_prgid[PG_LINECOLOR_INSERT_DESTALPHA_CRAM], (const GLchar *)"s_texture");
    }
 
    else if (prgid == PG_VDP2_BLUR)
@@ -4263,10 +4250,10 @@ int YglProgramChange( YglLevel * level, int prgid )
      current->cleanupUniform = Ygl_cleanupNormal_blur;
      current->vertexp = 0;
      current->texcoordp = 1;
-     current->mtxModelView = YglULocDirekt(_prgid[PG_VDP2_BLUR], (const GLchar *)"u_mvpMatrix");
-     current->mtxTexture = YglULocDirekt(_prgid[PG_VDP2_BLUR], (const GLchar *)"u_texMatrix");
-     current->color_offset = YglULocDirekt(_prgid[PG_VDP2_BLUR], (const GLchar *)"u_color_offset");
-     current->tex0 = YglULocDirekt(_prgid[PG_VDP2_BLUR], (const GLchar *)"s_texture");
+     current->mtxModelView = YglULocDirect(_prgid[PG_VDP2_BLUR], (const GLchar *)"u_mvpMatrix");
+     current->mtxTexture = YglULocDirect(_prgid[PG_VDP2_BLUR], (const GLchar *)"u_texMatrix");
+     current->color_offset = YglULocDirect(_prgid[PG_VDP2_BLUR], (const GLchar *)"u_color_offset");
+     current->tex0 = YglULocDirect(_prgid[PG_VDP2_BLUR], (const GLchar *)"s_texture");
    }else{
       level->prg[level->prgcurrent].setupUniform = NULL;
       level->prg[level->prgcurrent].cleanupUniform = NULL;
