@@ -97,6 +97,23 @@ to both `CMAKE_C_FLAGS` and `CMAKE_CXX_FLAGS`, and pass:
   -DCMAKE_AR=/usr/bin/gcc-ar -DCMAKE_RANLIB=/usr/bin/gcc-ranlib
 ```
 
+### Building for RK3566 (RGB30 and similar handhelds)
+
+This project targets RK3326 (Cortex-A35) by default, but RK3566 (Cortex-A55) handhelds
+like the Powkiddy RGB30 are a different, notably stronger chip — a straight RK3326 build
+runs on them, but isn't tuned for them. Swap `-mcpu=cortex-a35` for `-mcpu=cortex-a55` in
+both `CMAKE_C_FLAGS` and `CMAKE_CXX_FLAGS` (step 3) and in the LTO linker flags above if
+you're also using LTO.
+
+Confirmed on real RK3566 hardware (Powkiddy RGB30, dArkOS), `-mcpu=cortex-a55` plus the
+LTO build above (`-flto=4 -fno-fat-lto-objects` + `gcc-ar`/`gcc-ranlib`) gives a measured,
+if modest, improvement over the stock `-mcpu=cortex-a35` build on this chip: on a
+CPU-bound 3D-heavy title (Sega Rally Championship Plus), p95 frame time improved ~3%,
+p99 ~6%, and the fraction of frames missing the 60fps budget dropped from 45.2% to 43.7%.
+Not a dramatic fix — the remaining cost on titles like this is the SH2 core's own
+real per-frame work, not something flags can remove — but a real, free win for anyone
+already building for this SoC.
+
 ### Building on an x86 PC (arm64 chroot)
 
 No arm64 machine at hand? An arm64 Debian chroot with QEMU user emulation
