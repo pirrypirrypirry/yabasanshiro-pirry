@@ -111,6 +111,21 @@ sudo chroot /srv/trixie-arm64 /bin/bash
 # inside the chroot: steps 1–4 above
 ```
 
+ ### Building for RK3566 (Cortex-A55)
+
+  This project is developed and tested on RK3326 (Cortex-A35) only. An RK3326 build
+  also runs on RK3566 handhelds. To tune the build for that chip instead, replace
+  `-mcpu=cortex-a35` with `-mcpu=cortex-a55` in `CMAKE_C_FLAGS` and `CMAKE_CXX_FLAGS`
+  (step 3), and in `CMAKE_EXE_LINKER_FLAGS` if you use the LTO build above.
+
+  **A Cortex-A55 build is for RK3566 only.** It can use CPU instructions that the
+  Cortex-A35 does not have, so expect illegal-instruction crashes on RK3326 devices.
+
+  We don't test or publish RK3566 builds. A contributor reports that it runs on a
+  Powkiddy RGB30 with dArkOS and saw a small gain in one title, see
+  [PR #3](https://github.com/pirrypirrypirry/yabasanshiro-pirry/pull/3).
+
+
 ## License
 
 GPL-2.0-or-later, like Yaba Sanshiro / Yabause — see [LICENSE](LICENSE).
